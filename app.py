@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v4
+K線頭部 / 底部自動標記 v5
 
 最終邏輯：
 1. 先找事件點
@@ -24,7 +24,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
 
-st.set_page_config(page_title="K線頭部底部標記 v4", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v5", layout="wide")
 
 
 # =========================
@@ -34,9 +34,9 @@ DEFAULTS = {
     "crop_top_ratio": 0.31,
     "crop_bottom_ratio": 0.66,
     "crop_left_ratio": 0.00,
-    "crop_right_ratio": 0.88,
-    "crop_padding_ratio": 0.02,
-    "tolerance_px": 5,
+    "crop_right_ratio": 0.95,
+    "crop_padding_ratio": 0.00,
+    "tolerance_px": 0,
 }
 
 # 紅K、綠K、橘色5MA偵測門檻
@@ -310,34 +310,66 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
 # =========================
 # 事件點：白點 / 紅點
 # =========================
-def build_event_points(candles, tolerance_px=5):
+def build_event_points(candles, tolerance_px=0):
     """
-    白點 = 突破5MA：
-        今天收盤基準點高於5MA，且昨天未突破。
+    v5 修正版事件判定：
 
-    紅點 = 跌破5MA：
-        今天收盤基準點低於5MA，且昨天未跌破。
+    白點 = 突破 5MA：
+        今日收盤基準點在 5MA 上方，
+        且前一根的有效狀態不是「已突破」。
 
-    y座標越小代表價格越高：
-        rel = close_y - ma_y
-        rel < 0：收盤在5MA上方
-        rel > 0：收盤在5MA下方
+    紅點 = 跌破 5MA：
+        今日收盤基準點在 5MA 下方，
+        且前一根的有效狀態不是「已跌破」。
+
+    收盤基準點：
+        紅K = 實體上邊
+        綠K = 實體下邊
+
+    為了避免貼線造成連續誤判：
+        若某根K棒落在 tolerance_px 內，狀態視為 neutral，
+        neutral 不會立刻改變上一個有效狀態。
     """
 
     up_events = []    # 白點：突破
     down_events = []  # 紅點：跌破
 
-    for i in range(1, len(candles)):
-        prev_rel = candles[i - 1]["rel"]
-        curr_rel = candles[i]["rel"]
+    # raw_status:
+    # above   = 收盤基準點高於5MA
+    # below   = 收盤基準點低於5MA
+    # neutral = 貼線區，不直接觸發事件
+    raw_status = []
 
-        # 突破：昨收未突破，今收突破
-        if prev_rel >= -tolerance_px and curr_rel < -tolerance_px:
+    for c in candles:
+        rel = c["rel"]
+
+        # y座標越小，價格越高
+        # rel < 0：收盤基準點在5MA上方
+        # rel > 0：收盤基準點在5MA下方
+        if rel < -tolerance_px:
+            raw_status.append("above")
+        elif rel > tolerance_px:
+            raw_status.append("below")
+        else:
+            raw_status.append("neutral")
+
+    # 有效狀態：neutral 會沿用前一個有效狀態，避免貼線震盪亂產生事件
+    effective_prev = raw_status[0] if raw_status else "neutral"
+
+    for i in range(1, len(candles)):
+        curr = raw_status[i]
+
+        # 突破：現在是 above，前一個有效狀態不是 above
+        if curr == "above" and effective_prev != "above":
             up_events.append(i)
 
-        # 跌破：昨收未跌破，今收跌破
-        if prev_rel <= tolerance_px and curr_rel > tolerance_px:
+        # 跌破：現在是 below，前一個有效狀態不是 below
+        if curr == "below" and effective_prev != "below":
             down_events.append(i)
+
+        # 只有 above / below 才更新有效狀態；neutral 不更新
+        if curr != "neutral":
+            effective_prev = curr
 
     return up_events, down_events
 
@@ -557,9 +589,9 @@ def annotate_kline_image(
     crop_top_ratio=0.31,
     crop_bottom_ratio=0.66,
     crop_left_ratio=0.00,
-    crop_right_ratio=0.88,
-    crop_padding_ratio=0.02,
-    tolerance_px=5,
+    crop_right_ratio=0.95,
+    crop_padding_ratio=0.00,
+    tolerance_px=0,
     display_mode="HL",
     draw_box=True,
     draw_events=True,
@@ -674,7 +706,7 @@ def annotate_kline_image(
 # Streamlit UI
 # =========================
 st.title("K線頭部 / 底部 自動標記 v4")
-st.caption("白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；全部從右往左回推。")
+st.caption("v5：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；全部從右往左回推。貼線容許誤差預設0，避免把前一根已跌破/已突破又重複標成事件。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -712,7 +744,7 @@ with st.sidebar:
         0.08,
         DEFAULTS["crop_padding_ratio"],
         0.005,
-        help="若第一根K棒被切掉，請調小；若右側價格軸被誤抓，請調大。",
+        help="預設0。若右側價格軸或浮動按鈕被誤抓，可稍微調大；若第一根/最後一根K棒被切掉，請調回0。",
     )
 
     st.divider()
@@ -724,7 +756,7 @@ with st.sidebar:
         20,
         DEFAULTS["tolerance_px"],
         1,
-        help="避免收盤基準點剛好貼近5MA時被過度判定。通常 3~8 比較合理。",
+        help="建議先用0，代表嚴格判定。若5MA與收盤基準點太貼，可改成1~3。數字太大容易漏抓或誤判。",
     )
 
     st.divider()
