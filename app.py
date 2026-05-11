@@ -1,0 +1,565 @@
+# -*- coding: utf-8 -*-
+"""
+K線頭部/底部自動標記網頁版
+- iPhone / iPad：Safari 開網頁後上傳截圖即可使用
+- 支援模式1：H / L
+- 支援模式2：頭 / 底
+- 支援自動標記、圈出K棒、主圖裁切預覽、標記明細
+"""
+
+import io
+import numpy as np
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+
+st.set_page_config(page_title="K線頭部底部標記", layout="wide")
+
+DEFAULTS = {
+    "crop_top_ratio": 0.30,
+    "crop_bottom_ratio": 0.65,
+    "crop_left_ratio": 0.00,
+    "crop_right_ratio": 0.89,
+    "tolerance_px": 6,
+    "use_visible_left_edge_as_first_event": False,
+}
+
+RED_K = dict(r_min=170, g_max=110, b_max=110, rg_gap=50)
+GREEN_K = dict(g_min=115, r_max=120, b_max=120, gr_gap=35)
+ORANGE_MA = dict(r_min=120, g_min=45, g_max=190, b_max=130, rg_gap=15, gb_gap=10)
+
+
+def get_font(size: int, prefer_chinese=False):
+    candidates = []
+    if prefer_chinese:
+        candidates += [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/msyhbd.ttc",
+        ]
+
+    candidates += [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def pil_to_png_bytes(img: Image.Image):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def moving_median(arr, k=31):
+    out = np.empty_like(arr, dtype=float)
+    n = len(arr)
+    half = k // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.median(arr[lo:hi])
+    return out
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def detect_candles(crop, offset_x, offset_y):
+    h, w = crop.shape[:2]
+    r = crop[:, :, 0].astype(int)
+    g = crop[:, :, 1].astype(int)
+    b = crop[:, :, 2].astype(int)
+
+    red = (
+        (r > RED_K["r_min"]) &
+        (g < RED_K["g_max"]) &
+        (b < RED_K["b_max"]) &
+        ((r - g) > RED_K["rg_gap"])
+    )
+
+    green = (
+        (g > GREEN_K["g_min"]) &
+        (r < GREEN_K["r_max"]) &
+        (b < GREEN_K["b_max"]) &
+        ((g - r) > GREEN_K["gr_gap"])
+    )
+
+    candle_mask = red | green
+
+    col_counts = candle_mask.sum(axis=0)
+    active = col_counts >= 3
+
+    runs = []
+    max_gap = 5
+    i = 0
+    while i < w:
+        if not active[i]:
+            i += 1
+            continue
+
+        start = i
+        last = i
+        gap = 0
+        i += 1
+
+        while i < w:
+            if active[i]:
+                last = i
+                gap = 0
+            else:
+                gap += 1
+                if gap > max_gap:
+                    break
+            i += 1
+
+        runs.append((start, last))
+
+    candles = []
+    for start, end in runs:
+        width = end - start + 1
+
+        if width < 3 or width > 42:
+            continue
+
+        sub_mask = candle_mask[:, start:end + 1]
+        ys, xs = np.where(sub_mask)
+
+        if len(ys) < 20:
+            continue
+
+        y_min = int(ys.min())
+        y_max = int(ys.max())
+        height = y_max - y_min + 1
+
+        if height < 12 or height > int(h * 0.95):
+            continue
+
+        red_count = int(red[:, start:end + 1].sum())
+        green_count = int(green[:, start:end + 1].sum())
+        color = "red" if red_count >= green_count else "green"
+        color_mask = red[:, start:end + 1] if color == "red" else green[:, start:end + 1]
+
+        row_counts = color_mask.sum(axis=1)
+        max_row = int(row_counts.max())
+        body_threshold = max(3, int(max_row * 0.52))
+        body_rows = np.where(row_counts >= body_threshold)[0]
+
+        if len(body_rows) == 0:
+            body_rows = np.where(row_counts >= max(2, int(max_row * 0.35)))[0]
+
+        if len(body_rows) == 0:
+            body_top = y_min
+            body_bottom = y_max
+        else:
+            body_top = int(body_rows.min())
+            body_bottom = int(body_rows.max())
+
+        close_y = body_top if color == "red" else body_bottom
+        x_center = (start + end) // 2
+
+        candles.append({
+            "x_crop": x_center,
+            "x": x_center + offset_x,
+            "x1": start + offset_x,
+            "x2": end + offset_x,
+            "width": width,
+            "color": color,
+            "y_high": y_min + offset_y,
+            "y_low": y_max + offset_y,
+            "close_y": close_y + offset_y,
+            "body_top": body_top + offset_y,
+            "body_bottom": body_bottom + offset_y,
+        })
+
+    candles.sort(key=lambda c: c["x_crop"])
+
+    merged = []
+    for c in candles:
+        if merged and c["x_crop"] - merged[-1]["x_crop"] < 11:
+            old_h = merged[-1]["y_low"] - merged[-1]["y_high"]
+            new_h = c["y_low"] - c["y_high"]
+            if new_h > old_h:
+                merged[-1] = c
+        else:
+            merged.append(c)
+
+    return merged
+
+
+def detect_ma_y(crop, offset_y):
+    h, w = crop.shape[:2]
+    r = crop[:, :, 0].astype(int)
+    g = crop[:, :, 1].astype(int)
+    b = crop[:, :, 2].astype(int)
+    yy = np.arange(h)[:, None]
+
+    orange = (
+        (r > ORANGE_MA["r_min"]) &
+        (g > ORANGE_MA["g_min"]) & (g < ORANGE_MA["g_max"]) &
+        (b < ORANGE_MA["b_max"]) &
+        ((r - g) > ORANGE_MA["rg_gap"]) &
+        ((g - b) > ORANGE_MA["gb_gap"])
+    )
+
+    orange = orange & (yy > int(h * 0.08)) & (yy < int(h * 0.90))
+
+    xs = []
+    ys = []
+    for x in range(w):
+        yvals = np.where(orange[:, x])[0]
+        if len(yvals) > 0:
+            xs.append(x)
+            ys.append(float(np.median(yvals)))
+
+    if len(xs) < 10:
+        raise RuntimeError("找不到 5MA 橘線。請確認截圖有勾選 5MA，或調整主圖裁切範圍。")
+
+    xs = np.array(xs)
+    ys = np.array(ys)
+    all_x = np.arange(w)
+
+    raw = np.interp(all_x, xs, ys)
+    smooth = moving_median(raw, 41)
+
+    keep = np.abs(ys - smooth[xs]) < 35
+    if keep.sum() > 10:
+        ma = np.interp(all_x, xs[keep], ys[keep])
+        ma = moving_median(ma, 13)
+    else:
+        ma = smooth
+
+    return ma + offset_y
+
+
+def build_labels(candles, tolerance_px=6, use_visible_left_edge_as_first_event=False):
+    down_breaks = []
+    up_breaks = []
+
+    for i in range(1, len(candles)):
+        prev_rel = candles[i - 1]["rel"]
+        curr_rel = candles[i]["rel"]
+
+        if prev_rel <= tolerance_px and curr_rel > tolerance_px:
+            down_breaks.append(i)
+
+        if prev_rel >= -tolerance_px and curr_rel < -tolerance_px:
+            up_breaks.append(i)
+
+    labels = []
+
+    def add_label(idx, typ, start_idx, end_idx):
+        item = (idx, typ, start_idx, end_idx)
+        if item not in labels:
+            labels.append(item)
+
+    if use_visible_left_edge_as_first_event:
+        start = 0
+        for idx in down_breaks:
+            segment = range(start, idx + 1)
+            h_idx = min(segment, key=lambda j: candles[j]["y_high"])
+            add_label(h_idx, "H", start, idx)
+            start = idx
+    else:
+        for a, b in zip(down_breaks[:-1], down_breaks[1:]):
+            segment = range(a, b + 1)
+            h_idx = min(segment, key=lambda j: candles[j]["y_high"])
+            add_label(h_idx, "H", a, b)
+
+    if use_visible_left_edge_as_first_event:
+        start = 0
+        for idx in up_breaks:
+            segment = range(start, idx + 1)
+            l_idx = max(segment, key=lambda j: candles[j]["y_low"])
+            add_label(l_idx, "L", start, idx)
+            start = idx
+    else:
+        for a, b in zip(up_breaks[:-1], up_breaks[1:]):
+            segment = range(a, b + 1)
+            l_idx = max(segment, key=lambda j: candles[j]["y_low"])
+            add_label(l_idx, "L", a, b)
+
+    labels.sort(key=lambda x: (x[0], x[1]))
+    return labels, down_breaks, up_breaks
+
+
+def estimate_date(index, n, start_date, end_date):
+    if not start_date or not end_date or n <= 1:
+        return ""
+    try:
+        est = start_date + (end_date - start_date) * (index / (n - 1))
+        return est.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def estimate_price_from_y(y, chart_top_y, chart_bottom_y, price_top, price_bottom):
+    if price_top is None or price_bottom is None:
+        return None
+    if chart_bottom_y == chart_top_y:
+        return None
+    ratio = (chart_bottom_y - y) / (chart_bottom_y - chart_top_y)
+    price = price_bottom + ratio * (price_top - price_bottom)
+    return float(price)
+
+
+def draw_labels(img, candles, labels, crop_y0, crop_y1, display_mode="HL", draw_box=True, box_width=2):
+    out = img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(out)
+    use_chinese = display_mode == "頭底"
+
+    for idx, typ, start_idx, end_idx in labels:
+        c = candles[idx]
+
+        if display_mode == "HL":
+            text = "H" if typ == "H" else "L"
+        else:
+            text = "頭" if typ == "H" else "底"
+
+        # 嚴格遵守：圓形直徑不可超過K棒寬度
+        diam = max(3, int(c["width"]))
+        radius = diam / 2
+
+        font_size = max(6, diam)
+        font = get_font(font_size, prefer_chinese=use_chinese)
+        x = c["x"]
+
+        if typ == "H":
+            y = max(crop_y0 + 2, c["y_high"] - diam - 3)
+            text_color = (255, 0, 0, 255)
+            box_color = (255, 0, 0, 255)
+        else:
+            y = min(crop_y1 - diam - 3, c["y_low"] + 3)
+            text_color = (0, 170, 0, 255)
+            box_color = (0, 170, 0, 255)
+
+        if draw_box:
+            pad = 3
+            draw.rectangle(
+                [c["x1"] - pad, c["y_high"] - pad, c["x2"] + pad, c["y_low"] + pad],
+                outline=box_color,
+                width=box_width,
+            )
+
+        draw.ellipse(
+            [x - radius, y, x + radius, y + diam],
+            outline=(255, 255, 255, 255),
+            width=max(1, int(diam * 0.18)),
+            fill=(0, 0, 0, 0),
+        )
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        draw.text((x - tw / 2, y + diam / 2 - th / 2 - 1), text, font=font, fill=text_color)
+
+    return out.convert("RGB")
+
+
+def draw_main_crop_box(img, x0, y0, x1, y1):
+    out = img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([x0, y0, x1, y1], outline=(255, 180, 0, 255), width=4)
+    return out.convert("RGB")
+
+
+def annotate_kline_image(
+    img,
+    crop_top_ratio=0.30,
+    crop_bottom_ratio=0.65,
+    crop_left_ratio=0.00,
+    crop_right_ratio=0.89,
+    tolerance_px=6,
+    use_visible_left_edge_as_first_event=False,
+    display_mode="HL",
+    draw_box=True,
+    price_top=None,
+    price_bottom=None,
+    start_date=None,
+    end_date=None,
+):
+    img = img.convert("RGB")
+    W, H = img.size
+
+    x0 = int(W * crop_left_ratio)
+    x1 = int(W * crop_right_ratio)
+    y0 = int(H * crop_top_ratio)
+    y1 = int(H * crop_bottom_ratio)
+
+    if y1 <= y0 or x1 <= x0:
+        raise RuntimeError("裁切範圍不正確，請調整主圖上下左右邊界。")
+
+    crop_img = img.crop((x0, y0, x1, y1))
+    crop = np.array(crop_img)
+
+    candles = detect_candles(crop, x0, y0)
+    if len(candles) < 5:
+        raise RuntimeError("偵測到的 K 棒太少，請調整主圖裁切範圍。")
+
+    ma_y = detect_ma_y(crop, y0)
+    crop_w = crop.shape[1]
+
+    for i, c in enumerate(candles):
+        xc = clamp(c["x_crop"], 0, crop_w - 1)
+        c["index"] = i
+        c["ma_y"] = float(ma_y[xc])
+        c["rel"] = float(c["close_y"] - c["ma_y"])
+
+    labels, down_breaks, up_breaks = build_labels(candles, tolerance_px, use_visible_left_edge_as_first_event)
+
+    result = draw_labels(img, candles, labels, y0, y1, display_mode, draw_box)
+
+    rows = []
+    for idx, typ, start_idx, end_idx in labels:
+        c = candles[idx]
+        price_y = c["y_high"] if typ == "H" else c["y_low"]
+        price = estimate_price_from_y(price_y, y0, y1, price_top, price_bottom)
+        est_date = estimate_date(idx, len(candles), start_date, end_date)
+
+        rows.append({
+            "類型": "頭部" if typ == "H" else "底部",
+            "標記": "H" if typ == "H" else "L",
+            "K棒序號": idx + 1,
+            "區間起點序號": start_idx + 1,
+            "區間終點序號": end_idx + 1,
+            "估算日期": est_date,
+            "估算價格": "" if price is None else round(price, 2),
+            "K棒顏色": "紅K" if c["color"] == "red" else "綠K",
+        })
+
+    info = {
+        "candles": len(candles),
+        "down_breaks": len(down_breaks),
+        "up_breaks": len(up_breaks),
+        "labels": len(labels),
+        "crop_box": (x0, y0, x1, y1),
+        "crop_img": crop_img,
+    }
+
+    return result, rows, info
+
+
+st.title("K線頭部 / 底部 自動標記")
+st.caption("上傳截圖後，依你定義的 5MA 跌破/突破區間，自動標出頭部與底部。")
+
+with st.sidebar:
+    st.header("標示設定")
+
+    display_mode = st.radio("標示模式", ["HL", "頭底"], index=0)
+    draw_box = st.checkbox("圈出被判定的K棒", value=True)
+
+    st.divider()
+    st.header("主圖裁切")
+    crop_top_ratio = st.slider("主圖上緣", 0.00, 0.85, DEFAULTS["crop_top_ratio"], 0.01)
+    crop_bottom_ratio = st.slider("主圖下緣", 0.20, 1.00, DEFAULTS["crop_bottom_ratio"], 0.01)
+    crop_left_ratio = st.slider("主圖左邊界", 0.00, 0.40, DEFAULTS["crop_left_ratio"], 0.01)
+    crop_right_ratio = st.slider("主圖右邊界", 0.50, 1.00, DEFAULTS["crop_right_ratio"], 0.01)
+
+    st.divider()
+    st.header("判定設定")
+    tolerance_px = st.slider("貼線容許誤差", 0, 20, DEFAULTS["tolerance_px"], 1)
+    use_visible_left_edge_as_first_event = st.checkbox(
+        "把畫面最左邊視為第一段起點",
+        value=DEFAULTS["use_visible_left_edge_as_first_event"],
+        help="不勾選：嚴格等待兩個同類基準點才標示。勾選：第一段會從畫面最左邊開始算。",
+    )
+
+    st.divider()
+    st.header("日期/價格估算")
+    st.caption("這不是OCR。若要明細顯示日期與價格，請手動輸入圖上價格軸與日期範圍。")
+    use_est = st.checkbox("啟用估算日期/價格", value=False)
+
+    price_top = price_bottom = None
+    start_date = end_date = None
+    if use_est:
+        price_top = st.number_input("主圖上緣價格", value=30.0, step=0.1)
+        price_bottom = st.number_input("主圖下緣價格", value=24.0, step=0.1)
+        start_date = st.date_input("左側第一根K棒約略日期")
+        end_date = st.date_input("右側最後一根K棒約略日期")
+
+uploaded = st.file_uploader("上傳 K 線截圖", type=["png", "jpg", "jpeg", "webp"])
+
+if uploaded:
+    img = Image.open(uploaded).convert("RGB")
+    W, H = img.size
+
+    x0 = int(W * crop_left_ratio)
+    x1 = int(W * crop_right_ratio)
+    y0 = int(H * crop_top_ratio)
+    y1 = int(H * crop_bottom_ratio)
+    preview = draw_main_crop_box(img, x0, y0, x1, y1)
+
+    tab1, tab2, tab3 = st.tabs(["結果", "主圖裁切檢查", "原圖"])
+
+    try:
+        result, rows, info = annotate_kline_image(
+            img=img,
+            crop_top_ratio=crop_top_ratio,
+            crop_bottom_ratio=crop_bottom_ratio,
+            crop_left_ratio=crop_left_ratio,
+            crop_right_ratio=crop_right_ratio,
+            tolerance_px=tolerance_px,
+            use_visible_left_edge_as_first_event=use_visible_left_edge_as_first_event,
+            display_mode=display_mode,
+            draw_box=draw_box,
+            price_top=price_top,
+            price_bottom=price_bottom,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        with tab1:
+            st.subheader("標記結果")
+            st.image(result, use_container_width=True)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("K棒數", info["candles"])
+            c2.metric("跌破5MA次數", info["down_breaks"])
+            c3.metric("突破5MA次數", info["up_breaks"])
+            c4.metric("標記總數", info["labels"])
+
+            st.download_button(
+                "下載標記圖 PNG",
+                data=pil_to_png_bytes(result),
+                file_name=f"marked_{display_mode}.png",
+                mime="image/png",
+            )
+
+            if rows:
+                st.subheader("標記明細")
+                st.dataframe(rows, use_container_width=True)
+            else:
+                st.warning("目前沒有符合條件的標記。可試著勾選「把畫面最左邊視為第一段起點」，或調整裁切範圍。")
+
+        with tab2:
+            st.subheader("主圖裁切檢查")
+            st.caption("橘框應只包住主K線圖，不要包到成交量、KD、MACD。")
+            st.image(preview, use_container_width=True)
+            st.subheader("實際裁切區")
+            st.image(info["crop_img"], use_container_width=True)
+
+        with tab3:
+            st.subheader("原圖")
+            st.image(img, use_container_width=True)
+
+    except Exception as e:
+        with tab1:
+            st.error(f"處理失敗：{e}")
+        with tab2:
+            st.subheader("主圖裁切檢查")
+            st.image(preview, use_container_width=True)
+        with tab3:
+            st.image(img, use_container_width=True)
+else:
+    st.info("請先上傳一張K線截圖。")
