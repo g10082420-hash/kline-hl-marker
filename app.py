@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v6
+K線頭部 / 底部自動標記 v6.1
 
 最終邏輯：
 1. 先找事件點
@@ -29,7 +29,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
 
-st.set_page_config(page_title="K線頭部底部標記 v6", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v6.1", layout="wide")
 
 
 # =========================
@@ -125,11 +125,23 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     g = crop[:, :, 1].astype(int)
     b = crop[:, :, 2].astype(int)
 
+    # 5MA 橘線本身也很容易符合「紅色」門檻。
+    # 若不先扣掉，橘線會把多根 K 棒橫向串成一大段，最後被寬度上限濾掉。
+    ma_like = (
+        (r > ORANGE_MA["r_min"])
+        & (g > ORANGE_MA["g_min"])
+        & (g < ORANGE_MA["g_max"])
+        & (b < ORANGE_MA["b_max"])
+        & ((r - g) > ORANGE_MA["rg_gap"])
+        & ((g - b) > ORANGE_MA["gb_gap"])
+    )
+
     red = (
         (r > RED_K["r_min"])
         & (g < RED_K["g_max"])
         & (b < RED_K["b_max"])
         & ((r - g) > RED_K["rg_gap"])
+        & (~ma_like)
     )
 
     green = (
@@ -137,6 +149,7 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
         & (r < GREEN_K["r_max"])
         & (b < GREEN_K["b_max"])
         & ((g - r) > GREEN_K["gr_gap"])
+        & (~ma_like)
     )
 
     candle_mask = red | green
@@ -769,8 +782,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v6")
-st.caption("v6：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；最右側可先補暫定頭/底，等未來突破或跌破後再確認。")
+st.title("K線頭部 / 底部 自動標記 v6.1")
+st.caption("v6.1：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；最右側可先補暫定頭/底，並避免把橘色5MA誤抓成K棒。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -904,7 +917,7 @@ if uploaded:
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v6.png",
+                file_name=f"marked_{display_mode}_v6_1.png",
                 mime="image/png",
             )
 
