@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 K線頭部 / 底部自動標記網頁版
-修正版：依K棒實體收盤基準點判定突破/跌破，並從右邊往左回推配對。
+v3：修正主圖裁切保護邊距、避免兩根K棒被合併、相同高低點取較靠右者。
 
 使用方式：
 1. pip install -r requirements.txt
@@ -26,6 +26,7 @@ DEFAULTS = {
     "crop_bottom_ratio": 0.65,
     "crop_left_ratio": 0.00,
     "crop_right_ratio": 0.89,
+    "crop_padding_ratio": 0.025,
     "tolerance_px": 6,
 }
 
@@ -100,6 +101,27 @@ def draw_main_crop_box(img: Image.Image, x0: int, y0: int, x1: int, y1: int):
     return out.convert("RGB")
 
 
+def get_padded_crop_box(W, H, crop_top_ratio, crop_bottom_ratio, crop_left_ratio, crop_right_ratio, crop_padding_ratio=0.0):
+    """
+    依比例計算主圖範圍，再加一點保護邊距。
+    用途：避免最左 / 最右第一根K棒被裁切邊界切掉。
+    """
+    x0 = int(W * crop_left_ratio)
+    x1 = int(W * crop_right_ratio)
+    y0 = int(H * crop_top_ratio)
+    y1 = int(H * crop_bottom_ratio)
+
+    pad_x = int(W * crop_padding_ratio)
+    pad_y = int(H * crop_padding_ratio * 0.35)
+
+    x0 = clamp(x0 - pad_x, 0, W)
+    x1 = clamp(x1 + pad_x, 0, W)
+    y0 = clamp(y0 - pad_y, 0, H)
+    y1 = clamp(y1 + pad_y, 0, H)
+
+    return x0, y0, x1, y1
+
+
 # =========================
 # 偵測K棒
 # =========================
@@ -131,7 +153,8 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     active = col_counts >= 3
 
     runs = []
-    max_gap = 5
+    # v3：原本 max_gap=5 容易把相鄰兩根K棒包成同一根；改成1，盡量一根一框。
+    max_gap = 1
     i = 0
 
     while i < w:
@@ -225,11 +248,13 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
 
     candles.sort(key=lambda c: c["x_crop"])
 
-    # 合併距離太近的偵測結果，避免同一根K棒被拆成兩根
+    # v3：不要用中心距離合併，否則相鄰兩根K棒容易被包成一根。
+    # 只在兩個偵測框真的重疊或幾乎貼在一起時，才視為同一根K棒的拆分結果。
     merged = []
     for c in candles:
-        if merged and c["x_crop"] - merged[-1]["x_crop"] < 11:
-            old_h = merged[-1]["y_low"] - merged[-1]["y_high"]
+        if merged and c["x1"] <= merged[-1]["x2"] + 1:
+            old = merged[-1]
+            old_h = old["y_low"] - old["y_high"]
             new_h = c["y_low"] - c["y_high"]
             if new_h > old_h:
                 merged[-1] = c
@@ -364,7 +389,7 @@ def build_labels_right_to_left(candles, tolerance_px=6):
         left_idx = down_breaks[k - 1]
 
         segment = range(left_idx, right_idx + 1)  # 含兩端
-        h_idx = min(segment, key=lambda j: candles[j]["y_high"])  # y越小，價格越高
+        h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))  # y越小越高；同高點取較靠右者
 
         labels.append(
             {
@@ -382,7 +407,7 @@ def build_labels_right_to_left(candles, tolerance_px=6):
         left_idx = up_breaks[k - 1]
 
         segment = range(left_idx, right_idx + 1)  # 含兩端
-        l_idx = max(segment, key=lambda j: candles[j]["y_low"])  # y越大，價格越低
+        l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))  # y越大越低；同低點取較靠右者
 
         labels.append(
             {
@@ -513,6 +538,7 @@ def annotate_kline_image(
     crop_bottom_ratio=0.65,
     crop_left_ratio=0.00,
     crop_right_ratio=0.89,
+    crop_padding_ratio=0.025,
     tolerance_px=6,
     display_mode="HL",
     draw_box=True,
@@ -524,10 +550,12 @@ def annotate_kline_image(
     img = img.convert("RGB")
     W, H = img.size
 
-    x0 = int(W * crop_left_ratio)
-    x1 = int(W * crop_right_ratio)
-    y0 = int(H * crop_top_ratio)
-    y1 = int(H * crop_bottom_ratio)
+    x0, y0, x1, y1 = get_padded_crop_box(
+        W, H,
+        crop_top_ratio, crop_bottom_ratio,
+        crop_left_ratio, crop_right_ratio,
+        crop_padding_ratio,
+    )
 
     if y1 <= y0 or x1 <= x0:
         raise RuntimeError("裁切範圍不正確，請調整主圖上下左右邊界。")
@@ -613,7 +641,7 @@ def annotate_kline_image(
 # Streamlit UI
 # =========================
 st.title("K線頭部 / 底部 自動標記")
-st.caption("修正版：依『K棒實體收盤基準點 vs 5MA』判定突破/跌破，並從最右邊往左回推配對。")
+st.caption("v3：修正裁切保護邊距、避免兩根K棒被合併；同高/同低點取較靠右者。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -634,6 +662,14 @@ with st.sidebar:
     crop_bottom_ratio = st.slider("主圖下緣", 0.20, 1.00, DEFAULTS["crop_bottom_ratio"], 0.01)
     crop_left_ratio = st.slider("主圖左邊界", 0.00, 0.40, DEFAULTS["crop_left_ratio"], 0.01)
     crop_right_ratio = st.slider("主圖右邊界", 0.50, 1.00, DEFAULTS["crop_right_ratio"], 0.01)
+    crop_padding_ratio = st.slider(
+        "裁切保護邊距",
+        0.00,
+        0.08,
+        DEFAULTS["crop_padding_ratio"],
+        0.005,
+        help="如果第一根或最後一根K棒被切到，調大這個值。通常 0.02～0.04 就夠。",
+    )
 
     st.divider()
     st.header("判定設定")
@@ -672,10 +708,12 @@ if uploaded:
     img = Image.open(uploaded).convert("RGB")
     W, H = img.size
 
-    x0 = int(W * crop_left_ratio)
-    x1 = int(W * crop_right_ratio)
-    y0 = int(H * crop_top_ratio)
-    y1 = int(H * crop_bottom_ratio)
+    x0, y0, x1, y1 = get_padded_crop_box(
+        W, H,
+        crop_top_ratio, crop_bottom_ratio,
+        crop_left_ratio, crop_right_ratio,
+        crop_padding_ratio,
+    )
 
     preview = draw_main_crop_box(img, x0, y0, x1, y1)
 
@@ -688,6 +726,7 @@ if uploaded:
             crop_bottom_ratio=crop_bottom_ratio,
             crop_left_ratio=crop_left_ratio,
             crop_right_ratio=crop_right_ratio,
+            crop_padding_ratio=crop_padding_ratio,
             tolerance_px=tolerance_px,
             display_mode=display_mode,
             draw_box=draw_box,
