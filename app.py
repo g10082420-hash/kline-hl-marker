@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 K線頭部 / 底部自動標記網頁版
-修正版：依「從右邊往左邊回推」規則配對突破 / 跌破 5MA。
+修正版：依K棒實體收盤基準點判定突破/跌破，並從右邊往左回推配對。
 
 使用方式：
 1. pip install -r requirements.txt
@@ -302,49 +302,68 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
 # =========================
 def build_labels_right_to_left(candles, tolerance_px=6):
     """
-    使用者最終規則：
+    使用者最新版定義：
 
-    L：
-    從最右邊往左找「收盤突破5MA，且昨收未突破」的第1根、第2根，
-    在兩者區間內找最低點，標 L。
+    突破5MA：
+    - 紅K：實體上邊高於5MA
+    - 綠K：實體下邊高於5MA
 
-    H：
-    從最右邊往左找「收盤跌破5MA，且昨收未跌破」的第1根、第2根，
-    在兩者區間內找最高點，標 H。
+    跌破5MA：
+    - 紅K：實體上邊低於5MA
+    - 綠K：實體下邊低於5MA
 
-    區間均含兩個基準點。
+    程式內 close_y 已依K棒顏色定義：
+    - 紅K close_y = body_top，也就是實體上邊
+    - 綠K close_y = body_bottom，也就是實體下邊
+
+    事件判定：
+    - 突破5MA事件 = 昨收未突破，今收突破
+    - 跌破5MA事件 = 昨收未跌破，今收跌破
+
+    配對規則：
+    - 一律從右邊往左回推
+    - 找右邊第1個事件與左邊第2個同類事件
+    - 區間含兩端
     """
 
-    down_breaks = []  # 收盤跌破5MA：昨收未跌破，今收跌破
-    up_breaks = []    # 收盤突破5MA：昨收未突破，今收突破
+    def is_above_5ma(c):
+        # y越小代表價格越高，所以 close_y < ma_y 表示收盤基準點高於5MA
+        return c["close_y"] < c["ma_y"] - tolerance_px
+
+    def is_below_5ma(c):
+        # y越大代表價格越低，所以 close_y > ma_y 表示收盤基準點低於5MA
+        return c["close_y"] > c["ma_y"] + tolerance_px
+
+    down_breaks = []  # 跌破5MA：昨收未跌破，今收跌破
+    up_breaks = []    # 突破5MA：昨收未突破，今收突破
 
     # 先由左到右找出所有事件位置
     for i in range(1, len(candles)):
-        prev_rel = candles[i - 1]["rel"]
-        curr_rel = candles[i]["rel"]
+        prev = candles[i - 1]
+        curr = candles[i]
 
-        # y 越大代表價格越低
-        # rel > 0：收盤在 5MA 下方
-        # rel < 0：收盤在 5MA 上方
+        prev_above = is_above_5ma(prev)
+        curr_above = is_above_5ma(curr)
+        prev_below = is_below_5ma(prev)
+        curr_below = is_below_5ma(curr)
 
-        # 跌破5MA：昨天未跌破，今天跌破
-        if prev_rel <= tolerance_px and curr_rel > tolerance_px:
-            down_breaks.append(i)
-
-        # 突破5MA：昨天未突破，今天突破
-        if prev_rel >= -tolerance_px and curr_rel < -tolerance_px:
+        # 突破5MA：昨收未突破，今收突破
+        if (not prev_above) and curr_above:
             up_breaks.append(i)
+
+        # 跌破5MA：昨收未跌破，今收跌破
+        if (not prev_below) and curr_below:
+            down_breaks.append(i)
 
     labels = []
 
     # H：從右往左，兩兩配對「跌破5MA」事件
-    # 例如事件 [2, 8, 15, 23]：
-    # 先配 23-15，再配 15-8，再配 8-2
+    # 例如事件 [2, 8, 15, 23]：先配 23-15，再配 15-8，再配 8-2
     for k in range(len(down_breaks) - 1, 0, -1):
         right_idx = down_breaks[k]
         left_idx = down_breaks[k - 1]
 
-        segment = range(left_idx, right_idx + 1)
+        segment = range(left_idx, right_idx + 1)  # 含兩端
         h_idx = min(segment, key=lambda j: candles[j]["y_high"])  # y越小，價格越高
 
         labels.append(
@@ -362,7 +381,7 @@ def build_labels_right_to_left(candles, tolerance_px=6):
         right_idx = up_breaks[k]
         left_idx = up_breaks[k - 1]
 
-        segment = range(left_idx, right_idx + 1)
+        segment = range(left_idx, right_idx + 1)  # 含兩端
         l_idx = max(segment, key=lambda j: candles[j]["y_low"])  # y越大，價格越低
 
         labels.append(
@@ -378,11 +397,10 @@ def build_labels_right_to_left(candles, tolerance_px=6):
     # 畫圖用：由左到右畫，避免圖層順序混亂
     labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"]))
 
-    # 表格用：由右到左看，符合使用者邏輯
+    # 表格用：由右到左看，符合回推邏輯
     labels_for_table = sorted(labels, key=lambda x: x["right_idx"], reverse=True)
 
     return labels_for_draw, labels_for_table, down_breaks, up_breaks
-
 
 # =========================
 # 日期 / 價格估算
@@ -595,7 +613,7 @@ def annotate_kline_image(
 # Streamlit UI
 # =========================
 st.title("K線頭部 / 底部 自動標記")
-st.caption("修正版：依『從最右邊往左邊回推』規則，配對突破 / 跌破 5MA 事件。")
+st.caption("修正版：依『K棒實體收盤基準點 vs 5MA』判定突破/跌破，並從最右邊往左回推配對。")
 
 with st.sidebar:
     st.header("標示設定")
