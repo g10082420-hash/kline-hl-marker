@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v6.1
+K線頭部 / 底部自動標記 v7
 
 最終邏輯：
 1. 先找事件點
@@ -28,8 +28,13 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:
+    streamlit_image_coordinates = None
 
-st.set_page_config(page_title="K線頭部底部標記 v6.1", layout="wide")
+
+st.set_page_config(page_title="K線頭部底部標記 v7", layout="wide")
 
 
 # =========================
@@ -654,6 +659,264 @@ def draw_labels(
 
 
 # =========================
+# 手動標註
+# =========================
+MANUAL_TARGETS = ["突破點", "跌破點", "H", "L"]
+
+
+def nearest_candle_by_x(candles, x: float, max_x_dist: int):
+    if not candles:
+        return None
+
+    c = min(candles, key=lambda item: abs(item["x"] - x))
+    if abs(c["x"] - x) <= max_x_dist:
+        return c
+
+    return None
+
+
+def build_manual_mark(target: str, x: float, y: float, candles, max_x_dist: int):
+    c = nearest_candle_by_x(candles, x, max_x_dist)
+
+    mark = {
+        "target": target,
+        "raw_x": float(x),
+        "raw_y": float(y),
+        "x": float(x),
+        "y": float(y),
+        "idx": None,
+        "snapped": False,
+    }
+
+    if c is None:
+        return mark
+
+    mark["idx"] = int(c["index"])
+    mark["snapped"] = True
+
+    if target == "突破點" or target == "跌破點":
+        mark["x"] = float(c["x"])
+        mark["y"] = float(c["close_y"])
+    elif target == "H":
+        mark["x"] = float(c["x"])
+        mark["y"] = float(c["y_high"])
+    elif target == "L":
+        mark["x"] = float(c["x"])
+        mark["y"] = float(c["y_low"])
+
+    return mark
+
+
+def draw_manual_annotations(
+    img: Image.Image,
+    marks,
+    candles,
+    crop_y0: int,
+    crop_y1: int,
+    draw_box: bool = True,
+    label_scale: float = 1.6,
+):
+    out = img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(out)
+    candle_by_idx = {c["index"]: c for c in candles}
+
+    for mark in marks:
+        target = mark.get("target")
+        idx = mark.get("idx")
+        c = candle_by_idx.get(idx)
+        x = float(mark.get("x", mark.get("raw_x", 0)))
+        y = float(mark.get("y", mark.get("raw_y", 0)))
+
+        if target in ("突破點", "跌破點"):
+            width = c["width"] if c else 12
+            radius = max(4, min(7, int(width * 0.65)))
+
+            if target == "突破點":
+                fill = (255, 255, 255, 255)
+                outline = (0, 0, 0, 255)
+            else:
+                fill = (255, 0, 0, 255)
+                outline = (255, 255, 255, 255)
+
+            draw.ellipse(
+                [x - radius, y - radius, x + radius, y + radius],
+                fill=fill,
+                outline=outline,
+                width=2,
+            )
+            continue
+
+        if target not in ("H", "L"):
+            continue
+
+        width = c["width"] if c else 12
+        diam = max(11, int(width * label_scale))
+        diam = min(diam, 28)
+        radius = diam / 2
+        font_size = max(9, int(diam * 0.82))
+        font = get_font(font_size, prefer_chinese=False)
+
+        if target == "H":
+            label_y = max(crop_y0 + 2, y - diam - 4)
+            text_color = (255, 0, 0, 255)
+            box_color = (255, 0, 0, 255)
+        else:
+            label_y = min(crop_y1 - diam - 4, y + 4)
+            text_color = (0, 210, 0, 255)
+            box_color = (0, 210, 0, 255)
+
+        if draw_box and c:
+            pad = 3
+            draw.rectangle(
+                [c["x1"] - pad, c["y_high"] - pad, c["x2"] + pad, c["y_low"] + pad],
+                outline=box_color,
+                width=2,
+            )
+
+        draw.ellipse(
+            [x - radius, label_y, x + radius, label_y + diam],
+            outline=(255, 255, 255, 255),
+            width=max(1, int(diam * 0.16)),
+            fill=(0, 0, 0, 0),
+        )
+
+        bbox = draw.textbbox((0, 0), target, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        draw.text(
+            (x - tw / 2, label_y + diam / 2 - th / 2 - 1),
+            target,
+            font=font,
+            fill=text_color,
+        )
+
+    return out.convert("RGB")
+
+
+def manual_rows(marks):
+    rows = []
+    for i, mark in enumerate(marks, start=1):
+        rows.append(
+            {
+                "順序": i,
+                "目標": mark.get("target"),
+                "K棒序號": "" if mark.get("idx") is None else int(mark["idx"]) + 1,
+                "吸附": "是" if mark.get("snapped") else "否",
+                "X": round(float(mark.get("x", 0)), 1),
+                "Y": round(float(mark.get("y", 0)), 1),
+            }
+        )
+
+    return rows
+
+
+def detect_candles_for_box(img: Image.Image, crop_box):
+    x0, y0, x1, y1 = crop_box
+    crop_img = img.crop((x0, y0, x1, y1))
+    crop = np.array(crop_img)
+    candles = detect_candles(crop, x0, y0)
+    return crop_img, candles
+
+
+def render_manual_annotation_tab(
+    img: Image.Image,
+    crop_box,
+    upload_key: str,
+    draw_box: bool,
+    label_scale: float,
+):
+    x0, y0, x1, y1 = crop_box
+    safe_key = "".join(ch if ch.isalnum() else "_" for ch in upload_key)[-80:]
+    marks_key = f"manual_marks_{safe_key}"
+    last_click_key = f"manual_last_click_{safe_key}"
+
+    if marks_key not in st.session_state:
+        st.session_state[marks_key] = []
+    if last_click_key not in st.session_state:
+        st.session_state[last_click_key] = None
+
+    marks = st.session_state[marks_key]
+
+    st.subheader("手動標註")
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        target = st.radio("目前目標", MANUAL_TARGETS, horizontal=True, key=f"manual_target_{safe_key}")
+    with c2:
+        snap_dist = st.slider(
+            "K棒吸附距離",
+            5,
+            80,
+            35,
+            1,
+            key=f"manual_snap_{safe_key}",
+        )
+
+    b1, b2, b3 = st.columns(3)
+    if b1.button("復原上一筆", disabled=not marks, key=f"manual_undo_{safe_key}"):
+        marks.pop()
+        st.session_state[marks_key] = marks
+        st.rerun()
+
+    if b2.button("清空手動標註", disabled=not marks, key=f"manual_clear_{safe_key}"):
+        st.session_state[marks_key] = []
+        st.rerun()
+
+    try:
+        crop_img, candles = detect_candles_for_box(img, crop_box)
+    except Exception as e:
+        crop_img = img.crop(crop_box)
+        candles = []
+        st.warning(f"K棒吸附暫時不可用：{e}")
+
+    full_annotated = draw_manual_annotations(
+        img=img,
+        marks=marks,
+        candles=candles,
+        crop_y0=y0,
+        crop_y1=y1,
+        draw_box=draw_box,
+        label_scale=label_scale,
+    )
+    click_img = full_annotated.crop(crop_box)
+
+    if streamlit_image_coordinates is None:
+        st.error("手動標註需要 streamlit-image-coordinates。請先執行：pip install streamlit-image-coordinates")
+        st.image(click_img, use_container_width=True)
+    else:
+        click = streamlit_image_coordinates(
+            click_img,
+            use_column_width="always",
+            key=f"manual_click_{safe_key}",
+            cursor="crosshair",
+        )
+
+        if click and click.get("unix_time") != st.session_state[last_click_key]:
+            if click.get("width") and click.get("height"):
+                raw_x = x0 + click["x"] * (click_img.width / click["width"])
+                raw_y = y0 + click["y"] * (click_img.height / click["height"])
+                marks.append(build_manual_mark(target, raw_x, raw_y, candles, snap_dist))
+                st.session_state[marks_key] = marks
+                st.session_state[last_click_key] = click.get("unix_time")
+                st.rerun()
+
+    st.download_button(
+        "下載手動標註圖 PNG",
+        data=pil_to_png_bytes(full_annotated),
+        file_name="manual_marked.png",
+        mime="image/png",
+        disabled=not marks,
+        key=f"manual_download_{safe_key}",
+    )
+
+    if marks:
+        st.dataframe(manual_rows(marks), use_container_width=True)
+    else:
+        st.info("尚未建立手動標註。")
+
+
+# =========================
 # 主處理函式
 # =========================
 def annotate_kline_image(
@@ -782,8 +1045,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v6.1")
-st.caption("v6.1：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；最右側可先補暫定頭/底，並避免把橘色5MA誤抓成K棒。")
+st.title("K線頭部 / 底部 自動標記 v7")
+st.caption("v7：保留自動標記；新增手動標註，可選突破點、跌破點、H、L 後直接點 K 棒建立標記。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -881,7 +1144,7 @@ if uploaded:
 
     preview = draw_main_crop_box(img, x0, y0, x1, y1)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["結果", "主圖裁切檢查", "事件明細", "原圖"])
+    tab1, tab_manual, tab2, tab3, tab4 = st.tabs(["結果", "手動標註", "主圖裁切檢查", "事件明細", "原圖"])
 
     try:
         result, rows, info = annotate_kline_image(
@@ -917,7 +1180,7 @@ if uploaded:
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v6_1.png",
+                file_name=f"marked_{display_mode}_v7.png",
                 mime="image/png",
             )
 
@@ -961,6 +1224,16 @@ if uploaded:
         with tab4:
             st.subheader("原圖")
             st.image(img, use_container_width=True)
+
+    with tab_manual:
+        upload_key = f"{uploaded.name}:{getattr(uploaded, 'size', 0)}:{W}x{H}"
+        render_manual_annotation_tab(
+            img=img,
+            crop_box=(x0, y0, x1, y1),
+            upload_key=upload_key,
+            draw_box=draw_box,
+            label_scale=label_scale,
+        )
 
 else:
     st.info("請先上傳一張 K 線截圖。")
