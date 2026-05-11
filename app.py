@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v5
+K線頭部 / 底部自動標記 v6
 
 最終邏輯：
 1. 先找事件點
@@ -13,7 +13,12 @@ K線頭部 / 底部自動標記 v5
    - 全部從右邊往左邊回推
    - 區間內同高 / 同低，取較靠右邊那根
 
-3. 收盤基準點
+3. 右側暫定點
+   - 最新事件若為突破，從前一個跌破點到今日先找最高點，標暫定 H
+   - 最新事件若為跌破，從前一個突破點到今日先找最低點，標暫定 L
+   - 等未來形成下一個同類事件後，再由正式區間確認
+
+4. 收盤基準點
    - 紅K：實體上邊
    - 綠K：實體下邊
 """
@@ -24,7 +29,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
 
-st.set_page_config(page_title="K線頭部底部標記 v5", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v6", layout="wide")
 
 
 # =========================
@@ -377,13 +382,17 @@ def build_event_points(candles, tolerance_px=0):
 # =========================
 # 重點：兩白找低，兩紅找高，從右往左
 # =========================
-def build_hl_from_events(candles, up_events, down_events):
+def build_hl_from_events(candles, up_events, down_events, include_provisional=True):
     """
     兩個突破點之間找最低點 L。
     兩個跌破點之間找最高點 H。
     從右往左回推。
     區間含兩端。
     同高 / 同低取較右邊。
+
+    右側若還沒有形成下一個同類事件，保留一個暫定點：
+    最新事件為突破時，等待未來跌破確認頭部，所以先找暫定 H；
+    最新事件為跌破時，等待未來突破確認底部，所以先找暫定 L。
     """
 
     labels = []
@@ -405,6 +414,8 @@ def build_hl_from_events(candles, up_events, down_events):
                 "left_idx": left_idx,
                 "right_idx": right_idx,
                 "source": "兩個突破點",
+                "status": "已確認",
+                "provisional": False,
             }
         )
 
@@ -425,8 +436,56 @@ def build_hl_from_events(candles, up_events, down_events):
                 "left_idx": left_idx,
                 "right_idx": right_idx,
                 "source": "兩個跌破點",
+                "status": "已確認",
+                "provisional": False,
             }
         )
+
+    if include_provisional and candles:
+        existing = {(item["idx"], item["type"]) for item in labels}
+        current_idx = len(candles) - 1
+        last_up_idx = up_events[-1] if up_events else None
+        last_down_idx = down_events[-1] if down_events else None
+
+        if last_up_idx is not None and (last_down_idx is None or last_up_idx > last_down_idx):
+            # 已突破但尚未跌破：先推論目前區間最高點為暫定頭。
+            if last_down_idx is not None:
+                left_idx = last_down_idx
+                segment = range(left_idx, current_idx + 1)
+                h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
+
+                if (h_idx, "H") not in existing:
+                    labels.append(
+                        {
+                            "idx": h_idx,
+                            "type": "H",
+                            "left_idx": left_idx,
+                            "right_idx": current_idx,
+                            "source": "最新突破後暫定頭",
+                            "status": "暫定",
+                            "provisional": True,
+                        }
+                    )
+
+        elif last_down_idx is not None and (last_up_idx is None or last_down_idx > last_up_idx):
+            # 已跌破但尚未突破：先推論目前區間最低點為暫定底。
+            if last_up_idx is not None:
+                left_idx = last_up_idx
+                segment = range(left_idx, current_idx + 1)
+                l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
+
+                if (l_idx, "L") not in existing:
+                    labels.append(
+                        {
+                            "idx": l_idx,
+                            "type": "L",
+                            "left_idx": left_idx,
+                            "right_idx": current_idx,
+                            "source": "最新跌破後暫定底",
+                            "status": "暫定",
+                            "provisional": True,
+                        }
+                    )
 
     # 畫圖用：由左到右畫
     labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"]))
@@ -596,6 +655,7 @@ def annotate_kline_image(
     draw_box=True,
     draw_events=True,
     label_scale=1.6,
+    include_provisional=True,
     price_top=None,
     price_bottom=None,
     start_date=None,
@@ -646,6 +706,7 @@ def annotate_kline_image(
         candles,
         up_events=up_events,
         down_events=down_events,
+        include_provisional=include_provisional,
     )
 
     result = draw_labels(
@@ -677,6 +738,7 @@ def annotate_kline_image(
             {
                 "類型": "頭部" if typ == "H" else "底部",
                 "標記": "H" if typ == "H" else "L",
+                "狀態": item["status"],
                 "依據": item["source"],
                 "標記K棒序號": idx + 1,
                 "右側事件序號": item["right_idx"] + 1,
@@ -693,6 +755,8 @@ def annotate_kline_image(
         "up_events": len(up_events),
         "down_events": len(down_events),
         "labels": len(labels_for_draw),
+        "confirmed_labels": sum(1 for item in labels_for_draw if not item.get("provisional")),
+        "provisional_labels": sum(1 for item in labels_for_draw if item.get("provisional")),
         "crop_box": (x0, y0, x1, y1),
         "crop_img": crop_img,
         "up_event_indices": [i + 1 for i in up_events],
@@ -705,8 +769,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v4")
-st.caption("v5：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；全部從右往左回推。貼線容許誤差預設0，避免把前一根已跌破/已突破又重複標成事件。")
+st.title("K線頭部 / 底部 自動標記 v6")
+st.caption("v6：白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；最右側可先補暫定頭/底，等未來突破或跌破後再確認。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -757,6 +821,12 @@ with st.sidebar:
         DEFAULTS["tolerance_px"],
         1,
         help="建議先用0，代表嚴格判定。若5MA與收盤基準點太貼，可改成1~3。數字太大容易漏抓或誤判。",
+    )
+
+    include_provisional = st.checkbox(
+        "顯示最右側暫定頭/底",
+        value=True,
+        help="最新事件若是突破，先推暫定頭；最新事件若是跌破，先推暫定底。未來形成下一個同類事件後會由正式區間確認。",
     )
 
     st.divider()
@@ -813,6 +883,7 @@ if uploaded:
             draw_box=draw_box,
             draw_events=draw_events,
             label_scale=label_scale,
+            include_provisional=include_provisional,
             price_top=price_top,
             price_bottom=price_bottom,
             start_date=start_date,
@@ -828,11 +899,12 @@ if uploaded:
             c2.metric("白點突破數", info["up_events"])
             c3.metric("紅點跌破數", info["down_events"])
             c4.metric("H/L標記數", info["labels"])
+            st.caption(f"已確認 {info['confirmed_labels']} 個；暫定 {info['provisional_labels']} 個。")
 
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v4.png",
+                file_name=f"marked_{display_mode}_v6.png",
                 mime="image/png",
             )
 
@@ -855,7 +927,7 @@ if uploaded:
             st.write("白點突破事件序號：", info["up_event_indices"])
             st.write("紅點跌破事件序號：", info["down_event_indices"])
 
-            st.caption("規則：兩個白點之間找 L；兩個紅點之間找 H；區間含兩端；同高同低取右。")
+            st.caption("規則：兩個白點之間找 L；兩個紅點之間找 H；區間含兩端；同高同低取右。最右側若尚未成對，會依最後事件到今日補暫定點。")
 
             if rows:
                 st.subheader("H/L 區間明細")
