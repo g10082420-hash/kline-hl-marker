@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記網頁版
-v3：修正主圖裁切保護邊距、避免兩根K棒被合併、相同高低點取較靠右者。
+K線頭部 / 底部自動標記 v4
 
-使用方式：
-1. pip install -r requirements.txt
-2. streamlit run app.py
-3. iPhone Safari 開啟網址，上傳截圖
+最終邏輯：
+1. 先找事件點
+   - 白點 = 突破 5MA
+   - 紅點 = 跌破 5MA
+
+2. 再用事件點形成區間
+   - 兩個突破點之間，含兩端，找最低點，標 L
+   - 兩個跌破點之間，含兩端，找最高點，標 H
+   - 全部從右邊往左邊回推
+   - 區間內同高 / 同低，取較靠右邊那根
+
+3. 收盤基準點
+   - 紅K：實體上邊
+   - 綠K：實體下邊
 """
 
 import io
@@ -15,26 +24,26 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
 
-st.set_page_config(page_title="K線頭部底部標記", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v4", layout="wide")
 
 
 # =========================
 # 預設參數
 # =========================
 DEFAULTS = {
-    "crop_top_ratio": 0.30,
-    "crop_bottom_ratio": 0.65,
+    "crop_top_ratio": 0.31,
+    "crop_bottom_ratio": 0.66,
     "crop_left_ratio": 0.00,
-    "crop_right_ratio": 0.89,
-    "crop_padding_ratio": 0.025,
-    "tolerance_px": 6,
+    "crop_right_ratio": 0.88,
+    "crop_padding_ratio": 0.02,
+    "tolerance_px": 5,
 }
 
-# 紅K、綠K、橘色5MA 偵測門檻
-# 不同券商截圖顏色略有差異，必要時再微調
-RED_K = dict(r_min=170, g_max=120, b_max=120, rg_gap=45)
-GREEN_K = dict(g_min=115, r_max=130, b_max=130, gr_gap=30)
-ORANGE_MA = dict(r_min=120, g_min=45, g_max=200, b_max=150, rg_gap=10, gb_gap=5)
+# 紅K、綠K、橘色5MA偵測門檻
+# 若券商截圖顏色不同，可在這裡微調
+RED_K = dict(r_min=170, g_max=125, b_max=125, rg_gap=45)
+GREEN_K = dict(g_min=115, r_max=135, b_max=135, gr_gap=28)
+ORANGE_MA = dict(r_min=120, g_min=45, g_max=205, b_max=155, rg_gap=8, gb_gap=3)
 
 
 # =========================
@@ -101,29 +110,8 @@ def draw_main_crop_box(img: Image.Image, x0: int, y0: int, x1: int, y1: int):
     return out.convert("RGB")
 
 
-def get_padded_crop_box(W, H, crop_top_ratio, crop_bottom_ratio, crop_left_ratio, crop_right_ratio, crop_padding_ratio=0.0):
-    """
-    依比例計算主圖範圍，再加一點保護邊距。
-    用途：避免最左 / 最右第一根K棒被裁切邊界切掉。
-    """
-    x0 = int(W * crop_left_ratio)
-    x1 = int(W * crop_right_ratio)
-    y0 = int(H * crop_top_ratio)
-    y1 = int(H * crop_bottom_ratio)
-
-    pad_x = int(W * crop_padding_ratio)
-    pad_y = int(H * crop_padding_ratio * 0.35)
-
-    x0 = clamp(x0 - pad_x, 0, W)
-    x1 = clamp(x1 + pad_x, 0, W)
-    y0 = clamp(y0 - pad_y, 0, H)
-    y1 = clamp(y1 + pad_y, 0, H)
-
-    return x0, y0, x1, y1
-
-
 # =========================
-# 偵測K棒
+# 偵測 K 棒
 # =========================
 def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     h, w = crop.shape[:2]
@@ -148,13 +136,12 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
 
     candle_mask = red | green
 
-    # 以 x 欄位聚合，抓出每根K棒可能所在區段
+    # 以 x 欄位聚合，抓每根K棒可能範圍
     col_counts = candle_mask.sum(axis=0)
     active = col_counts >= 3
 
     runs = []
-    # v3：原本 max_gap=5 容易把相鄰兩根K棒包成同一根；改成1，盡量一根一框。
-    max_gap = 1
+    max_gap = 1  # 避免把兩根很近的K棒包在一起
     i = 0
 
     while i < w:
@@ -185,20 +172,20 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
         width = end - start + 1
 
         # 太窄多半雜訊；太寬可能是價格標籤或文字
-        if width < 3 or width > 45:
+        if width < 3 or width > 42:
             continue
 
         sub_mask = candle_mask[:, start:end + 1]
         ys, xs = np.where(sub_mask)
 
-        if len(ys) < 20:
+        if len(ys) < 18:
             continue
 
         y_min = int(ys.min())
         y_max = int(ys.max())
         height = y_max - y_min + 1
 
-        if height < 12 or height > int(h * 0.95):
+        if height < 10 or height > int(h * 0.95):
             continue
 
         red_count = int(red[:, start:end + 1].sum())
@@ -207,7 +194,7 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
         color = "red" if red_count >= green_count else "green"
         color_mask = red[:, start:end + 1] if color == "red" else green[:, start:end + 1]
 
-        # 實體判斷：同一列顏色像素多的區段較可能是K棒實體
+        # 找K棒實體：同一列顏色像素多者較像實體，1~2像素較像影線
         row_counts = color_mask.sum(axis=1)
         max_row = int(row_counts.max())
 
@@ -225,8 +212,8 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
             body_bottom = int(body_rows.max())
 
         # 使用者定義：
-        # 紅K：收盤價 = 實體上緣
-        # 綠K：收盤價 = 實體下緣
+        # 紅K收盤基準點 = 實體上邊
+        # 綠K收盤基準點 = 實體下邊
         close_y = body_top if color == "red" else body_bottom
         x_center = (start + end) // 2
 
@@ -248,13 +235,11 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
 
     candles.sort(key=lambda c: c["x_crop"])
 
-    # v3：不要用中心距離合併，否則相鄰兩根K棒容易被包成一根。
-    # 只在兩個偵測框真的重疊或幾乎貼在一起時，才視為同一根K棒的拆分結果。
+    # 只在框真的重疊 / 幾乎貼住時才合併，避免兩根K棒被包成一根
     merged = []
     for c in candles:
         if merged and c["x1"] <= merged[-1]["x2"] + 1:
-            old = merged[-1]
-            old_h = old["y_low"] - old["y_high"]
+            old_h = merged[-1]["y_low"] - merged[-1]["y_high"]
             new_h = c["y_low"] - c["y_high"]
             if new_h > old_h:
                 merged[-1] = c
@@ -268,7 +253,7 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
 
 
 # =========================
-# 偵測5MA橘線
+# 偵測 5MA 橘線
 # =========================
 def detect_ma_y(crop: np.ndarray, offset_y: int):
     h, w = crop.shape[:2]
@@ -288,7 +273,7 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
         & ((g - b) > ORANGE_MA["gb_gap"])
     )
 
-    # 避開主圖內上方說明文字與下方日期/勾選列
+    # 避開主圖內上方文字與下方日期/勾選列
     orange = orange & (yy > int(h * 0.08)) & (yy < int(h * 0.90))
 
     xs = []
@@ -310,7 +295,7 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
     raw = np.interp(all_x, xs, ys)
     smooth = moving_median(raw, 41)
 
-    # 排除被文字或標籤誤抓到的橘色雜訊
+    # 排除橘色文字 / 標籤雜訊
     keep = np.abs(ys - smooth[xs]) < 35
 
     if keep.sum() > 10:
@@ -323,91 +308,63 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
 
 
 # =========================
-# 重點：從右往左配對事件
+# 事件點：白點 / 紅點
 # =========================
-def build_labels_right_to_left(candles, tolerance_px=6):
+def build_event_points(candles, tolerance_px=5):
     """
-    使用者最新版定義：
+    白點 = 突破5MA：
+        今天收盤基準點高於5MA，且昨天未突破。
 
-    突破5MA：
-    - 紅K：實體上邊高於5MA
-    - 綠K：實體下邊高於5MA
+    紅點 = 跌破5MA：
+        今天收盤基準點低於5MA，且昨天未跌破。
 
-    跌破5MA：
-    - 紅K：實體上邊低於5MA
-    - 綠K：實體下邊低於5MA
-
-    程式內 close_y 已依K棒顏色定義：
-    - 紅K close_y = body_top，也就是實體上邊
-    - 綠K close_y = body_bottom，也就是實體下邊
-
-    事件判定：
-    - 突破5MA事件 = 昨收未突破，今收突破
-    - 跌破5MA事件 = 昨收未跌破，今收跌破
-
-    配對規則：
-    - 一律從右邊往左回推
-    - 找右邊第1個事件與左邊第2個同類事件
-    - 區間含兩端
+    y座標越小代表價格越高：
+        rel = close_y - ma_y
+        rel < 0：收盤在5MA上方
+        rel > 0：收盤在5MA下方
     """
 
-    def is_above_5ma(c):
-        # y越小代表價格越高，所以 close_y < ma_y 表示收盤基準點高於5MA
-        return c["close_y"] < c["ma_y"] - tolerance_px
+    up_events = []    # 白點：突破
+    down_events = []  # 紅點：跌破
 
-    def is_below_5ma(c):
-        # y越大代表價格越低，所以 close_y > ma_y 表示收盤基準點低於5MA
-        return c["close_y"] > c["ma_y"] + tolerance_px
-
-    down_breaks = []  # 跌破5MA：昨收未跌破，今收跌破
-    up_breaks = []    # 突破5MA：昨收未突破，今收突破
-
-    # 先由左到右找出所有事件位置
     for i in range(1, len(candles)):
-        prev = candles[i - 1]
-        curr = candles[i]
+        prev_rel = candles[i - 1]["rel"]
+        curr_rel = candles[i]["rel"]
 
-        prev_above = is_above_5ma(prev)
-        curr_above = is_above_5ma(curr)
-        prev_below = is_below_5ma(prev)
-        curr_below = is_below_5ma(curr)
+        # 突破：昨收未突破，今收突破
+        if prev_rel >= -tolerance_px and curr_rel < -tolerance_px:
+            up_events.append(i)
 
-        # 突破5MA：昨收未突破，今收突破
-        if (not prev_above) and curr_above:
-            up_breaks.append(i)
+        # 跌破：昨收未跌破，今收跌破
+        if prev_rel <= tolerance_px and curr_rel > tolerance_px:
+            down_events.append(i)
 
-        # 跌破5MA：昨收未跌破，今收跌破
-        if (not prev_below) and curr_below:
-            down_breaks.append(i)
+    return up_events, down_events
+
+
+# =========================
+# 重點：兩白找低，兩紅找高，從右往左
+# =========================
+def build_hl_from_events(candles, up_events, down_events):
+    """
+    兩個突破點之間找最低點 L。
+    兩個跌破點之間找最高點 H。
+    從右往左回推。
+    區間含兩端。
+    同高 / 同低取較右邊。
+    """
 
     labels = []
 
-    # H：從右往左，兩兩配對「跌破5MA」事件
-    # 例如事件 [2, 8, 15, 23]：先配 23-15，再配 15-8，再配 8-2
-    for k in range(len(down_breaks) - 1, 0, -1):
-        right_idx = down_breaks[k]
-        left_idx = down_breaks[k - 1]
+    # L：兩個白點 / 突破點之間找最低點
+    for k in range(len(up_events) - 1, 0, -1):
+        right_idx = up_events[k]
+        left_idx = up_events[k - 1]
 
-        segment = range(left_idx, right_idx + 1)  # 含兩端
-        h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))  # y越小越高；同高點取較靠右者
+        segment = range(left_idx, right_idx + 1)
 
-        labels.append(
-            {
-                "idx": h_idx,
-                "type": "H",
-                "left_idx": left_idx,
-                "right_idx": right_idx,
-                "source": "跌破5MA",
-            }
-        )
-
-    # L：從右往左，兩兩配對「突破5MA」事件
-    for k in range(len(up_breaks) - 1, 0, -1):
-        right_idx = up_breaks[k]
-        left_idx = up_breaks[k - 1]
-
-        segment = range(left_idx, right_idx + 1)  # 含兩端
-        l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))  # y越大越低；同低點取較靠右者
+        # y_low 越大代表價格越低；同低取較右，所以 key 第二項用 index
+        l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
 
         labels.append(
             {
@@ -415,17 +372,38 @@ def build_labels_right_to_left(candles, tolerance_px=6):
                 "type": "L",
                 "left_idx": left_idx,
                 "right_idx": right_idx,
-                "source": "突破5MA",
+                "source": "兩個突破點",
             }
         )
 
-    # 畫圖用：由左到右畫，避免圖層順序混亂
+    # H：兩個紅點 / 跌破點之間找最高點
+    for k in range(len(down_events) - 1, 0, -1):
+        right_idx = down_events[k]
+        left_idx = down_events[k - 1]
+
+        segment = range(left_idx, right_idx + 1)
+
+        # y_high 越小代表價格越高；同高取較右，所以 key 第二項用 -index
+        h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
+
+        labels.append(
+            {
+                "idx": h_idx,
+                "type": "H",
+                "left_idx": left_idx,
+                "right_idx": right_idx,
+                "source": "兩個跌破點",
+            }
+        )
+
+    # 畫圖用：由左到右畫
     labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"]))
 
-    # 表格用：由右到左看，符合回推邏輯
+    # 表格用：由右到左看
     labels_for_table = sorted(labels, key=lambda x: x["right_idx"], reverse=True)
 
-    return labels_for_draw, labels_for_table, down_breaks, up_breaks
+    return labels_for_draw, labels_for_table
+
 
 # =========================
 # 日期 / 價格估算
@@ -455,21 +433,61 @@ def estimate_price_from_y(y, chart_top_y, chart_bottom_y, price_top, price_botto
 
 
 # =========================
-# 畫標記
+# 畫事件點：白點 / 紅點
+# =========================
+def draw_event_points(draw, candles, up_events, down_events):
+    # 白點：突破
+    for idx in up_events:
+        c = candles[idx]
+        x = c["x"]
+        y = c["close_y"]
+        r = max(3, min(5, int(c["width"] * 0.55)))
+
+        draw.ellipse(
+            [x - r, y - r, x + r, y + r],
+            fill=(255, 255, 255, 255),
+            outline=(0, 0, 0, 255),
+            width=1,
+        )
+
+    # 紅點：跌破
+    for idx in down_events:
+        c = candles[idx]
+        x = c["x"]
+        y = c["close_y"]
+        r = max(3, min(5, int(c["width"] * 0.55)))
+
+        draw.ellipse(
+            [x - r, y - r, x + r, y + r],
+            fill=(255, 0, 0, 255),
+            outline=(255, 255, 255, 255),
+            width=1,
+        )
+
+
+# =========================
+# 畫 H / L
 # =========================
 def draw_labels(
     img: Image.Image,
     candles,
     labels_for_draw,
+    up_events,
+    down_events,
     crop_y0: int,
     crop_y1: int,
     display_mode: str = "HL",
     draw_box: bool = True,
+    draw_events: bool = True,
+    label_scale: float = 1.6,
 ):
     out = img.copy().convert("RGBA")
     draw = ImageDraw.Draw(out)
 
     use_chinese = display_mode == "頭底"
+
+    if draw_events:
+        draw_event_points(draw, candles, up_events, down_events)
 
     for item in labels_for_draw:
         idx = item["idx"]
@@ -481,23 +499,25 @@ def draw_labels(
         else:
             text = "頭" if typ == "H" else "底"
 
-        # 嚴格遵守：圓形直徑不可超過K棒寬度
-        diam = max(3, int(c["width"]))
+        # 使用者原本要求：直徑不可超過K棒。
+        # 但手機圖上常太小，這裡提供 label_scale；若要嚴格版，設 1.0。
+        diam = max(7, int(c["width"] * label_scale))
+        diam = min(diam, 22)
         radius = diam / 2
 
-        font_size = max(6, diam)
+        font_size = max(8, int(diam * 0.9))
         font = get_font(font_size, prefer_chinese=use_chinese)
 
         x = c["x"]
 
         if typ == "H":
-            y = max(crop_y0 + 2, c["y_high"] - diam - 3)
+            y = max(crop_y0 + 2, c["y_high"] - diam - 4)
             text_color = (255, 0, 0, 255)
             box_color = (255, 0, 0, 255)
         else:
-            y = min(crop_y1 - diam - 3, c["y_low"] + 3)
-            text_color = (0, 180, 0, 255)
-            box_color = (0, 180, 0, 255)
+            y = min(crop_y1 - diam - 4, c["y_low"] + 4)
+            text_color = (0, 190, 0, 255)
+            box_color = (0, 190, 0, 255)
 
         if draw_box:
             pad = 3
@@ -511,7 +531,7 @@ def draw_labels(
         draw.ellipse(
             [x - radius, y, x + radius, y + diam],
             outline=(255, 255, 255, 255),
-            width=max(1, int(diam * 0.18)),
+            width=max(1, int(diam * 0.16)),
             fill=(0, 0, 0, 0),
         )
 
@@ -534,14 +554,16 @@ def draw_labels(
 # =========================
 def annotate_kline_image(
     img: Image.Image,
-    crop_top_ratio=0.30,
-    crop_bottom_ratio=0.65,
+    crop_top_ratio=0.31,
+    crop_bottom_ratio=0.66,
     crop_left_ratio=0.00,
-    crop_right_ratio=0.89,
-    crop_padding_ratio=0.025,
-    tolerance_px=6,
+    crop_right_ratio=0.88,
+    crop_padding_ratio=0.02,
+    tolerance_px=5,
     display_mode="HL",
     draw_box=True,
+    draw_events=True,
+    label_scale=1.6,
     price_top=None,
     price_bottom=None,
     start_date=None,
@@ -550,12 +572,17 @@ def annotate_kline_image(
     img = img.convert("RGB")
     W, H = img.size
 
-    x0, y0, x1, y1 = get_padded_crop_box(
-        W, H,
-        crop_top_ratio, crop_bottom_ratio,
-        crop_left_ratio, crop_right_ratio,
-        crop_padding_ratio,
-    )
+    pad_x = int(W * crop_padding_ratio)
+
+    x0 = int(W * crop_left_ratio) + pad_x
+    x1 = int(W * crop_right_ratio) - pad_x
+    y0 = int(H * crop_top_ratio)
+    y1 = int(H * crop_bottom_ratio)
+
+    x0 = clamp(x0, 0, W - 1)
+    x1 = clamp(x1, 1, W)
+    y0 = clamp(y0, 0, H - 1)
+    y1 = clamp(y1, 1, H)
 
     if y1 <= y0 or x1 <= x0:
         raise RuntimeError("裁切範圍不正確，請調整主圖上下左右邊界。")
@@ -577,24 +604,30 @@ def annotate_kline_image(
         c["index"] = i
         c["ma_y"] = float(ma_y[xc])
 
-        # y 越大代表價格越低
-        # rel > 0：收盤在 5MA 下方
-        # rel < 0：收盤在 5MA 上方
+        # rel < 0：收盤基準點在5MA上方
+        # rel > 0：收盤基準點在5MA下方
         c["rel"] = float(c["close_y"] - c["ma_y"])
 
-    labels_for_draw, labels_for_table, down_breaks, up_breaks = build_labels_right_to_left(
+    up_events, down_events = build_event_points(candles, tolerance_px=tolerance_px)
+
+    labels_for_draw, labels_for_table = build_hl_from_events(
         candles,
-        tolerance_px=tolerance_px,
+        up_events=up_events,
+        down_events=down_events,
     )
 
     result = draw_labels(
         img=img,
         candles=candles,
         labels_for_draw=labels_for_draw,
+        up_events=up_events,
+        down_events=down_events,
         crop_y0=y0,
         crop_y1=y1,
         display_mode=display_mode,
         draw_box=draw_box,
+        draw_events=draw_events,
+        label_scale=label_scale,
     )
 
     rows = []
@@ -612,10 +645,10 @@ def annotate_kline_image(
             {
                 "類型": "頭部" if typ == "H" else "底部",
                 "標記": "H" if typ == "H" else "L",
-                "事件類型": item["source"],
+                "依據": item["source"],
                 "標記K棒序號": idx + 1,
-                "右側基準點序號": item["right_idx"] + 1,
-                "左側基準點序號": item["left_idx"] + 1,
+                "右側事件序號": item["right_idx"] + 1,
+                "左側事件序號": item["left_idx"] + 1,
                 "區間": f'{item["left_idx"] + 1} ~ {item["right_idx"] + 1}',
                 "估算日期": est_date,
                 "估算價格": "" if price is None else round(price, 2),
@@ -625,13 +658,13 @@ def annotate_kline_image(
 
     info = {
         "candles": len(candles),
-        "down_breaks": len(down_breaks),
-        "up_breaks": len(up_breaks),
+        "up_events": len(up_events),
+        "down_events": len(down_events),
         "labels": len(labels_for_draw),
         "crop_box": (x0, y0, x1, y1),
         "crop_img": crop_img,
-        "down_break_indices": [i + 1 for i in down_breaks],
-        "up_break_indices": [i + 1 for i in up_breaks],
+        "up_event_indices": [i + 1 for i in up_events],
+        "down_event_indices": [i + 1 for i in down_events],
     }
 
     return result, rows, info
@@ -640,8 +673,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記")
-st.caption("v3：修正裁切保護邊距、避免兩根K棒被合併；同高/同低點取較靠右者。")
+st.title("K線頭部 / 底部 自動標記 v4")
+st.caption("白點=突破5MA；紅點=跌破5MA；兩白找低點L，兩紅找高點H；全部從右往左回推。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -653,7 +686,17 @@ with st.sidebar:
         help="HL = H/L；頭底 = 頭/底",
     )
 
-    draw_box = st.checkbox("圈出被判定的K棒", value=True)
+    draw_box = st.checkbox("圈出被判定的H/L K棒", value=True)
+    draw_events = st.checkbox("顯示事件點：白點突破、紅點跌破", value=True)
+
+    label_scale = st.slider(
+        "H/L 標記大小倍率",
+        1.0,
+        3.0,
+        1.6,
+        0.1,
+        help="若要嚴格遵守直徑不超過K棒，請調成 1.0。",
+    )
 
     st.divider()
     st.header("主圖裁切")
@@ -662,13 +705,14 @@ with st.sidebar:
     crop_bottom_ratio = st.slider("主圖下緣", 0.20, 1.00, DEFAULTS["crop_bottom_ratio"], 0.01)
     crop_left_ratio = st.slider("主圖左邊界", 0.00, 0.40, DEFAULTS["crop_left_ratio"], 0.01)
     crop_right_ratio = st.slider("主圖右邊界", 0.50, 1.00, DEFAULTS["crop_right_ratio"], 0.01)
+
     crop_padding_ratio = st.slider(
         "裁切保護邊距",
         0.00,
         0.08,
         DEFAULTS["crop_padding_ratio"],
         0.005,
-        help="如果第一根或最後一根K棒被切到，調大這個值。通常 0.02～0.04 就夠。",
+        help="若第一根K棒被切掉，請調小；若右側價格軸被誤抓，請調大。",
     )
 
     st.divider()
@@ -680,7 +724,7 @@ with st.sidebar:
         20,
         DEFAULTS["tolerance_px"],
         1,
-        help="避免收盤價剛好貼近5MA時被過度判定。通常 4~8 比較合理。",
+        help="避免收盤基準點剛好貼近5MA時被過度判定。通常 3~8 比較合理。",
     )
 
     st.divider()
@@ -708,12 +752,17 @@ if uploaded:
     img = Image.open(uploaded).convert("RGB")
     W, H = img.size
 
-    x0, y0, x1, y1 = get_padded_crop_box(
-        W, H,
-        crop_top_ratio, crop_bottom_ratio,
-        crop_left_ratio, crop_right_ratio,
-        crop_padding_ratio,
-    )
+    pad_x = int(W * crop_padding_ratio)
+
+    x0 = int(W * crop_left_ratio) + pad_x
+    x1 = int(W * crop_right_ratio) - pad_x
+    y0 = int(H * crop_top_ratio)
+    y1 = int(H * crop_bottom_ratio)
+
+    x0 = clamp(x0, 0, W - 1)
+    x1 = clamp(x1, 1, W)
+    y0 = clamp(y0, 0, H - 1)
+    y1 = clamp(y1, 1, H)
 
     preview = draw_main_crop_box(img, x0, y0, x1, y1)
 
@@ -730,6 +779,8 @@ if uploaded:
             tolerance_px=tolerance_px,
             display_mode=display_mode,
             draw_box=draw_box,
+            draw_events=draw_events,
+            label_scale=label_scale,
             price_top=price_top,
             price_bottom=price_bottom,
             start_date=start_date,
@@ -742,14 +793,14 @@ if uploaded:
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("K棒數", info["candles"])
-            c2.metric("跌破5MA事件數", info["down_breaks"])
-            c3.metric("突破5MA事件數", info["up_breaks"])
-            c4.metric("標記總數", info["labels"])
+            c2.metric("白點突破數", info["up_events"])
+            c3.metric("紅點跌破數", info["down_events"])
+            c4.metric("H/L標記數", info["labels"])
 
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_right_to_left.png",
+                file_name=f"marked_{display_mode}_v4.png",
                 mime="image/png",
             )
 
@@ -757,7 +808,7 @@ if uploaded:
                 st.subheader("標記明細（由右往左排序）")
                 st.dataframe(rows, use_container_width=True)
             else:
-                st.warning("目前沒有形成兩個同類基準點，因此沒有標記。")
+                st.warning("目前沒有形成兩個同類事件點，因此沒有 H/L 標記。")
 
         with tab2:
             st.subheader("主圖裁切檢查")
@@ -768,12 +819,14 @@ if uploaded:
             st.image(info["crop_img"], use_container_width=True)
 
         with tab3:
-            st.subheader("突破 / 跌破事件序號")
-            st.write("跌破5MA事件序號：", info["down_break_indices"])
-            st.write("突破5MA事件序號：", info["up_break_indices"])
+            st.subheader("事件點序號")
+            st.write("白點突破事件序號：", info["up_event_indices"])
+            st.write("紅點跌破事件序號：", info["down_event_indices"])
+
+            st.caption("規則：兩個白點之間找 L；兩個紅點之間找 H；區間含兩端；同高同低取右。")
 
             if rows:
-                st.subheader("標記區間明細")
+                st.subheader("H/L 區間明細")
                 st.dataframe(rows, use_container_width=True)
 
         with tab4:
