@@ -1,24 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v7
+K線頭部 / 底部自動標記 v9
 
 最終邏輯：
 1. 先找事件點
-   - 白點 = 突破 5MA
-   - 紅點 = 跌破 5MA
+   - 白點 = 突破 5MA：昨 close < 5MA 且今 close > 5MA
+   - 紅點 = 跌破 5MA：昨 close > 5MA 且今 close < 5MA
 
-2. 再用事件點形成區間
-   - 兩個突破點之間，含兩端，找最低點，標 L
-   - 兩個跌破點之間，含兩端，找最高點，標 H
-   - 全部從右邊往左邊回推
-   - 區間內同高 / 同低，取較靠右邊那根
+2. 假設今日為 T，從 T 往前回推
+   - a = 第一個跌破 5MA 之日，含 T
+   - b = 第一個突破 5MA 之日，含 T
+   - 若 a 早於 b，L1 = a 與 b 之間 low 最小值，含 a、b
+   - 若 a 晚於 b，H1 = a 與 b 之間 high 最大值，含 a、b
+   - c = a 往前第一個跌破 5MA 之日，不含 a
+   - d = b 往前第一個突破 5MA 之日，不含 b
+   - L2 = b 與 c 之間 low 最小值，含 b、c
+   - H2 = a 與 d 之間 high 最大值，含 a、d
 
-3. 右側暫定點
-   - 最新事件若為突破，從前一個跌破點到今日先找最高點，標暫定 H
-   - 最新事件若為跌破，從前一個突破點到今日先找最低點，標暫定 L
-   - 等未來形成下一個同類事件後，再由正式區間確認
-
-4. 收盤基準點
+3. 收盤基準點
    - 紅K：實體上邊
    - 綠K：實體下邊
 """
@@ -34,7 +33,7 @@ except Exception:
     streamlit_image_coordinates = None
 
 
-st.set_page_config(page_title="K線頭部底部標記 v7", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v9", layout="wide")
 
 
 # =========================
@@ -335,23 +334,22 @@ def detect_ma_y(crop: np.ndarray, offset_y: int):
 # =========================
 def build_event_points(candles, tolerance_px=0):
     """
-    v5 修正版事件判定：
+    事件判定：
 
     白點 = 突破 5MA：
-        今日收盤基準點在 5MA 上方，
-        且前一根的有效狀態不是「已突破」。
+        昨日收盤基準點在 5MA 下方，
+        今日收盤基準點在 5MA 上方。
 
     紅點 = 跌破 5MA：
-        今日收盤基準點在 5MA 下方，
-        且前一根的有效狀態不是「已跌破」。
+        昨日收盤基準點在 5MA 上方，
+        今日收盤基準點在 5MA 下方。
 
     收盤基準點：
         紅K = 實體上邊
         綠K = 實體下邊
 
-    為了避免貼線造成連續誤判：
-        若某根K棒落在 tolerance_px 內，狀態視為 neutral，
-        neutral 不會立刻改變上一個有效狀態。
+    若某根K棒落在 tolerance_px 內，狀態視為 neutral，
+    不會觸發突破 / 跌破。
     """
 
     up_events = []    # 白點：突破
@@ -376,142 +374,124 @@ def build_event_points(candles, tolerance_px=0):
         else:
             raw_status.append("neutral")
 
-    # 有效狀態：neutral 會沿用前一個有效狀態，避免貼線震盪亂產生事件
-    effective_prev = raw_status[0] if raw_status else "neutral"
-
     for i in range(1, len(candles)):
+        prev = raw_status[i - 1]
         curr = raw_status[i]
 
-        # 突破：現在是 above，前一個有效狀態不是 above
-        if curr == "above" and effective_prev != "above":
+        # 突破：昨 close < 5MA，今 close > 5MA
+        if prev == "below" and curr == "above":
             up_events.append(i)
 
-        # 跌破：現在是 below，前一個有效狀態不是 below
-        if curr == "below" and effective_prev != "below":
+        # 跌破：昨 close > 5MA，今 close < 5MA
+        if prev == "above" and curr == "below":
             down_events.append(i)
-
-        # 只有 above / below 才更新有效狀態；neutral 不更新
-        if curr != "neutral":
-            effective_prev = curr
 
     return up_events, down_events
 
 
 # =========================
-# 重點：兩白找低，兩紅找高，從右往左
+# 重點：依 T 回推 a / b / c / d 後產生 H-L
 # =========================
-def build_hl_from_events(candles, up_events, down_events, include_provisional=True):
+def build_hl_from_events(candles, up_events, down_events):
     """
-    兩個突破點之間找最低點 L。
-    兩個跌破點之間找最高點 H。
-    從右往左回推。
-    區間含兩端。
-    同高 / 同低取較右邊。
+    假設今日為 T，也就是最後一根 K 棒：
 
-    右側若還沒有形成下一個同類事件，保留一個暫定點：
-    最新事件為突破時，等待未來跌破確認頭部，所以先找暫定 H；
-    最新事件為跌破時，等待未來突破確認底部，所以先找暫定 L。
+    a = T 往前第一個跌破 5MA 之日，含 T
+    b = T 往前第一個突破 5MA 之日，含 T
+
+    L1 = 若 a 早於 b，取 a 與 b 兩點之間的 low 最小值，含 a、b
+    H1 = 若 a 晚於 b，取 a 與 b 兩點之間的 high 最大值，含 a、b
+
+    c = a 往前第一個跌破 5MA 之日，不含 a
+    d = b 往前第一個突破 5MA 之日，不含 b
+
+    L2 = b 與 c 兩點之間的 low 最小值，含 b、c
+    H2 = a 與 d 兩點之間的 high 最大值，含 a、d
+
+    區間內同高 / 同低取較右邊。
     """
 
     labels = []
 
-    # L：兩個白點 / 突破點之間找最低點
-    for k in range(len(up_events) - 1, 0, -1):
-        right_idx = up_events[k]
-        left_idx = up_events[k - 1]
+    if not candles:
+        return labels, labels
 
+    current_idx = len(candles) - 1
+    a = latest_event_before_or_at(down_events, current_idx)
+    b = latest_event_before_or_at(up_events, current_idx)
+
+    if a is None or b is None:
+        return labels, labels
+
+    c = latest_event_before_or_at(down_events, a - 1)
+    d = latest_event_before_or_at(up_events, b - 1)
+
+    def append_l(name, event_1, event_2, source):
+        left_idx, right_idx = sorted((event_1, event_2))
         segment = range(left_idx, right_idx + 1)
 
-        # y_low 越大代表價格越低；同低取較右，所以 key 第二項用 index
-        l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
+        # y_low 越大代表價格越低；同低取較右。
+        idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
 
         labels.append(
             {
-                "idx": l_idx,
+                "idx": idx,
                 "type": "L",
+                "name": name,
                 "left_idx": left_idx,
                 "right_idx": right_idx,
-                "source": "兩個突破點",
-                "status": "已確認",
+                "source": source,
+                "status": "已計算",
                 "provisional": False,
             }
         )
 
-    # H：兩個紅點 / 跌破點之間找最高點
-    for k in range(len(down_events) - 1, 0, -1):
-        right_idx = down_events[k]
-        left_idx = down_events[k - 1]
-
+    def append_h(name, event_1, event_2, source):
+        left_idx, right_idx = sorted((event_1, event_2))
         segment = range(left_idx, right_idx + 1)
 
-        # y_high 越小代表價格越高；同高取較右，所以 key 第二項用 -index
-        h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
+        # y_high 越小代表價格越高；同高取較右。
+        idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
 
         labels.append(
             {
-                "idx": h_idx,
+                "idx": idx,
                 "type": "H",
+                "name": name,
                 "left_idx": left_idx,
                 "right_idx": right_idx,
-                "source": "兩個跌破點",
-                "status": "已確認",
+                "source": source,
+                "status": "已計算",
                 "provisional": False,
             }
         )
 
-    if include_provisional and candles:
-        existing = {(item["idx"], item["type"]) for item in labels}
-        current_idx = len(candles) - 1
-        last_up_idx = up_events[-1] if up_events else None
-        last_down_idx = down_events[-1] if down_events else None
+    if a < b:
+        append_l("L1", a, b, "a早於b，a-b取最低 low")
+    elif a > b:
+        append_h("H1", a, b, "a晚於b，a-b取最高 high")
 
-        if last_up_idx is not None and (last_down_idx is None or last_up_idx > last_down_idx):
-            # 已突破但尚未跌破：先推論目前區間最高點為暫定頭。
-            if last_down_idx is not None:
-                left_idx = last_down_idx
-                segment = range(left_idx, current_idx + 1)
-                h_idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
+    if c is not None:
+        append_l("L2", b, c, "b-c取最低 low")
 
-                if (h_idx, "H") not in existing:
-                    labels.append(
-                        {
-                            "idx": h_idx,
-                            "type": "H",
-                            "left_idx": left_idx,
-                            "right_idx": current_idx,
-                            "source": "最新突破後暫定頭",
-                            "status": "暫定",
-                            "provisional": True,
-                        }
-                    )
-
-        elif last_down_idx is not None and (last_up_idx is None or last_down_idx > last_up_idx):
-            # 已跌破但尚未突破：先推論目前區間最低點為暫定底。
-            if last_up_idx is not None:
-                left_idx = last_up_idx
-                segment = range(left_idx, current_idx + 1)
-                l_idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
-
-                if (l_idx, "L") not in existing:
-                    labels.append(
-                        {
-                            "idx": l_idx,
-                            "type": "L",
-                            "left_idx": left_idx,
-                            "right_idx": current_idx,
-                            "source": "最新跌破後暫定底",
-                            "status": "暫定",
-                            "provisional": True,
-                        }
-                    )
+    if d is not None:
+        append_h("H2", a, d, "a-d取最高 high")
 
     # 畫圖用：由左到右畫
-    labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"]))
+    labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"], x["name"]))
 
     # 表格用：由右到左看
     labels_for_table = sorted(labels, key=lambda x: x["right_idx"], reverse=True)
 
     return labels_for_draw, labels_for_table
+
+
+def latest_event_before_or_at(events, idx):
+    for event_idx in reversed(events):
+        if event_idx <= idx:
+            return event_idx
+
+    return None
 
 
 # =========================
@@ -675,6 +655,22 @@ def nearest_candle_by_x(candles, x: float, max_x_dist: int):
     return None
 
 
+def snap_manual_mark_to_candle(mark, candle):
+    target = mark.get("target")
+    mark["idx"] = int(candle["index"])
+    mark["snapped"] = True
+    mark["x"] = float(candle["x"])
+
+    if target == "突破點" or target == "跌破點":
+        mark["y"] = float(candle["close_y"])
+    elif target == "H":
+        mark["y"] = float(candle["y_high"])
+    elif target == "L":
+        mark["y"] = float(candle["y_low"])
+
+    return mark
+
+
 def build_manual_mark(target: str, x: float, y: float, candles, max_x_dist: int):
     c = nearest_candle_by_x(candles, x, max_x_dist)
 
@@ -691,20 +687,24 @@ def build_manual_mark(target: str, x: float, y: float, candles, max_x_dist: int)
     if c is None:
         return mark
 
-    mark["idx"] = int(c["index"])
-    mark["snapped"] = True
+    return snap_manual_mark_to_candle(mark, c)
 
-    if target == "突破點" or target == "跌破點":
-        mark["x"] = float(c["x"])
-        mark["y"] = float(c["close_y"])
-    elif target == "H":
-        mark["x"] = float(c["x"])
-        mark["y"] = float(c["y_high"])
-    elif target == "L":
-        mark["x"] = float(c["x"])
-        mark["y"] = float(c["y_low"])
 
-    return mark
+def move_manual_mark(mark, candles, offset: int):
+    if not candles or mark.get("idx") is None:
+        return mark
+
+    candle_by_idx = {int(c["index"]): c for c in candles}
+    current_idx = int(mark["idx"])
+    next_idx = clamp(current_idx + offset, 0, len(candles) - 1)
+    next_candle = candle_by_idx.get(next_idx)
+
+    if next_candle is None:
+        return mark
+
+    mark["adjust_count"] = int(mark.get("adjust_count", 0)) + abs(next_idx - current_idx)
+
+    return snap_manual_mark_to_candle(mark, next_candle)
 
 
 def draw_manual_annotations(
@@ -803,6 +803,7 @@ def manual_rows(marks):
                 "目標": mark.get("target"),
                 "K棒序號": "" if mark.get("idx") is None else int(mark["idx"]) + 1,
                 "吸附": "是" if mark.get("snapped") else "否",
+                "左右修正": int(mark.get("adjust_count", 0)),
                 "X": round(float(mark.get("x", 0)), 1),
                 "Y": round(float(mark.get("y", 0)), 1),
             }
@@ -825,6 +826,7 @@ def render_manual_annotation_tab(
     upload_key: str,
     draw_box: bool,
     label_scale: float,
+    auto_img: Image.Image = None,
 ):
     x0, y0, x1, y1 = crop_box
     safe_key = "".join(ch if ch.isalnum() else "_" for ch in upload_key)[-80:]
@@ -840,6 +842,20 @@ def render_manual_annotation_tab(
 
     st.subheader("手動標註")
 
+    base_options = ["完全原圖"]
+    if auto_img is not None:
+        base_options.insert(0, "自動標記圖")
+
+    base_choice = st.radio(
+        "手動底稿",
+        base_options,
+        horizontal=True,
+        key=f"manual_base_{safe_key}",
+    )
+    use_auto_base = base_choice == "自動標記圖" and auto_img is not None
+    base_img = auto_img if use_auto_base else img
+    base_key = "auto" if use_auto_base else "original"
+
     c1, c2 = st.columns([2, 1])
     with c1:
         target = st.radio("目前目標", MANUAL_TARGETS, horizontal=True, key=f"manual_target_{safe_key}")
@@ -853,16 +869,6 @@ def render_manual_annotation_tab(
             key=f"manual_snap_{safe_key}",
         )
 
-    b1, b2, b3 = st.columns(3)
-    if b1.button("復原上一筆", disabled=not marks, key=f"manual_undo_{safe_key}"):
-        marks.pop()
-        st.session_state[marks_key] = marks
-        st.rerun()
-
-    if b2.button("清空手動標註", disabled=not marks, key=f"manual_clear_{safe_key}"):
-        st.session_state[marks_key] = []
-        st.rerun()
-
     try:
         crop_img, candles = detect_candles_for_box(img, crop_box)
     except Exception as e:
@@ -870,8 +876,50 @@ def render_manual_annotation_tab(
         candles = []
         st.warning(f"K棒吸附暫時不可用：{e}")
 
+    active_mark = marks[-1] if marks else None
+    can_adjust = bool(active_mark and active_mark.get("idx") is not None and candles)
+    active_idx = int(active_mark["idx"]) if can_adjust else None
+
+    if can_adjust:
+        st.caption(f"目前修正：第 {len(marks)} 筆 / {active_mark.get('target')} / 第 {active_idx + 1} 根K棒")
+    elif marks:
+        st.caption(f"目前修正：第 {len(marks)} 筆 / 未吸附到K棒")
+    else:
+        st.caption("目前修正：尚無手動標註")
+
+    m1, m2 = st.columns(2)
+    if m1.button(
+        "← 往左一根",
+        disabled=not can_adjust or active_idx <= 0,
+        key=f"manual_left_{safe_key}",
+        use_container_width=True,
+    ):
+        marks[-1] = move_manual_mark(marks[-1], candles, -1)
+        st.session_state[marks_key] = marks
+        st.rerun()
+
+    if m2.button(
+        "往右一根 →",
+        disabled=not can_adjust or active_idx >= len(candles) - 1,
+        key=f"manual_right_{safe_key}",
+        use_container_width=True,
+    ):
+        marks[-1] = move_manual_mark(marks[-1], candles, 1)
+        st.session_state[marks_key] = marks
+        st.rerun()
+
+    b1, b2 = st.columns(2)
+    if b1.button("復原上一筆", disabled=not marks, key=f"manual_undo_{safe_key}", use_container_width=True):
+        marks.pop()
+        st.session_state[marks_key] = marks
+        st.rerun()
+
+    if b2.button("清空手動標註", disabled=not marks, key=f"manual_clear_{safe_key}", use_container_width=True):
+        st.session_state[marks_key] = []
+        st.rerun()
+
     full_annotated = draw_manual_annotations(
-        img=img,
+        img=base_img,
         marks=marks,
         candles=candles,
         crop_y0=y0,
@@ -888,7 +936,7 @@ def render_manual_annotation_tab(
         click = streamlit_image_coordinates(
             click_img,
             use_column_width="always",
-            key=f"manual_click_{safe_key}",
+            key=f"manual_click_{safe_key}_{base_key}",
             cursor="crosshair",
         )
 
@@ -904,7 +952,7 @@ def render_manual_annotation_tab(
     st.download_button(
         "下載手動標註圖 PNG",
         data=pil_to_png_bytes(full_annotated),
-        file_name="manual_marked.png",
+        file_name=f"manual_marked_{base_key}.png",
         mime="image/png",
         disabled=not marks,
         key=f"manual_download_{safe_key}",
@@ -931,7 +979,6 @@ def annotate_kline_image(
     draw_box=True,
     draw_events=True,
     label_scale=1.6,
-    include_provisional=True,
     price_top=None,
     price_bottom=None,
     start_date=None,
@@ -982,7 +1029,6 @@ def annotate_kline_image(
         candles,
         up_events=up_events,
         down_events=down_events,
-        include_provisional=include_provisional,
     )
 
     result = draw_labels(
@@ -1014,6 +1060,7 @@ def annotate_kline_image(
             {
                 "類型": "頭部" if typ == "H" else "底部",
                 "標記": "H" if typ == "H" else "L",
+                "代號": item["name"],
                 "狀態": item["status"],
                 "依據": item["source"],
                 "標記K棒序號": idx + 1,
@@ -1045,8 +1092,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v7")
-st.caption("v7：保留自動標記；新增手動標註，可選突破點、跌破點、H、L 後直接點 K 棒建立標記。")
+st.title("K線頭部 / 底部 自動標記 v9")
+st.caption("v9：H/L 採 T 回推 a、b、c、d；手動標註新增底稿選擇與最後一筆左右修正。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -1099,13 +1146,6 @@ with st.sidebar:
         help="建議先用0，代表嚴格判定。若5MA與收盤基準點太貼，可改成1~3。數字太大容易漏抓或誤判。",
     )
 
-    include_provisional = st.checkbox(
-        "顯示最右側暫定頭/底",
-        value=True,
-        help="最新事件若是突破，先推暫定頭；最新事件若是跌破，先推暫定底。未來形成下一個同類事件後會由正式區間確認。",
-    )
-
-    st.divider()
     st.header("日期 / 價格估算")
     st.caption("目前不是 OCR。若要明細顯示日期與價格，請手動輸入價格軸與日期範圍。")
 
@@ -1145,6 +1185,7 @@ if uploaded:
     preview = draw_main_crop_box(img, x0, y0, x1, y1)
 
     tab1, tab_manual, tab2, tab3, tab4 = st.tabs(["結果", "手動標註", "主圖裁切檢查", "事件明細", "原圖"])
+    auto_result = None
 
     try:
         result, rows, info = annotate_kline_image(
@@ -1159,12 +1200,12 @@ if uploaded:
             draw_box=draw_box,
             draw_events=draw_events,
             label_scale=label_scale,
-            include_provisional=include_provisional,
             price_top=price_top,
             price_bottom=price_bottom,
             start_date=start_date,
             end_date=end_date,
         )
+        auto_result = result
 
         with tab1:
             st.subheader("標記結果")
@@ -1175,12 +1216,12 @@ if uploaded:
             c2.metric("白點突破數", info["up_events"])
             c3.metric("紅點跌破數", info["down_events"])
             c4.metric("H/L標記數", info["labels"])
-            st.caption(f"已確認 {info['confirmed_labels']} 個；暫定 {info['provisional_labels']} 個。")
+            st.caption("H/L 依最後一根 T 回推 a、b、c、d 後產生。")
 
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v7.png",
+                file_name=f"marked_{display_mode}_v9.png",
                 mime="image/png",
             )
 
@@ -1188,7 +1229,7 @@ if uploaded:
                 st.subheader("標記明細（由右往左排序）")
                 st.dataframe(rows, use_container_width=True)
             else:
-                st.warning("目前沒有形成兩個同類事件點，因此沒有 H/L 標記。")
+                st.warning("目前缺少可回推的突破或跌破事件，因此沒有 H/L 標記。")
 
         with tab2:
             st.subheader("主圖裁切檢查")
@@ -1203,7 +1244,7 @@ if uploaded:
             st.write("白點突破事件序號：", info["up_event_indices"])
             st.write("紅點跌破事件序號：", info["down_event_indices"])
 
-            st.caption("規則：兩個白點之間找 L；兩個紅點之間找 H；區間含兩端；同高同低取右。最右側若尚未成對，會依最後事件到今日補暫定點。")
+            st.caption("規則：a為T往前第一個跌破，b為T往前第一個突破；L1/H1看a、b先後，L2用b-c，H2用a-d；區間含兩端，同高同低取右。")
 
             if rows:
                 st.subheader("H/L 區間明細")
@@ -1233,6 +1274,7 @@ if uploaded:
             upload_key=upload_key,
             draw_box=draw_box,
             label_scale=label_scale,
+            auto_img=auto_result,
         )
 
 else:
