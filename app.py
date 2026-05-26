@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v10
+K線頭部 / 底部自動標記 v11
 
 最終邏輯：
 1. 先找事件點
@@ -33,7 +33,7 @@ except Exception:
     streamlit_image_coordinates = None
 
 
-st.set_page_config(page_title="K線頭部底部標記 v10", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v11", layout="wide")
 
 
 # =========================
@@ -122,6 +122,66 @@ def draw_main_crop_box(img: Image.Image, x0: int, y0: int, x1: int, y1: int):
 # =========================
 # 偵測 K 棒
 # =========================
+def find_row_segments(row_counts, max_gap=2):
+    rows = np.where(row_counts > 0)[0]
+
+    if len(rows) == 0:
+        return []
+
+    segments = []
+    start = int(rows[0])
+    prev = int(rows[0])
+
+    for row in rows[1:]:
+        row = int(row)
+
+        if row - prev <= max_gap + 1:
+            prev = row
+            continue
+
+        area = int(row_counts[start:prev + 1].sum())
+        segments.append((start, prev, area))
+        start = row
+        prev = row
+
+    area = int(row_counts[start:prev + 1].sum())
+    segments.append((start, prev, area))
+
+    return segments
+
+
+def dominant_vertical_span(sub_mask, merge_gap=2, bridge_gap=8):
+    row_counts = sub_mask.sum(axis=1)
+    segments = find_row_segments(row_counts, max_gap=merge_gap)
+
+    if not segments:
+        return None
+
+    primary = max(
+        segments,
+        key=lambda item: (item[2], item[1] - item[0] + 1),
+    )
+    top, bottom, _ = primary
+
+    changed = True
+    while changed:
+        changed = False
+        for seg_top, seg_bottom, _ in segments:
+            if seg_bottom < top:
+                gap = top - seg_bottom - 1
+            elif seg_top > bottom:
+                gap = seg_top - bottom - 1
+            else:
+                gap = 0
+
+            if gap <= bridge_gap and (seg_top < top or seg_bottom > bottom):
+                top = min(top, seg_top)
+                bottom = max(bottom, seg_bottom)
+                changed = True
+
+    return top, bottom
+
+
 def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     h, w = crop.shape[:2]
 
@@ -197,24 +257,36 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
         if width < 3 or width > 42:
             continue
 
-        sub_mask = candle_mask[:, start:end + 1]
+        sub_mask_all = candle_mask[:, start:end + 1]
+        span = dominant_vertical_span(sub_mask_all)
+
+        if span is None:
+            continue
+
+        span_top, span_bottom = span
+        sub_mask = sub_mask_all[span_top:span_bottom + 1]
         ys, xs = np.where(sub_mask)
 
         if len(ys) < 18:
             continue
 
-        y_min = int(ys.min())
-        y_max = int(ys.max())
+        y_min = int(ys.min()) + span_top
+        y_max = int(ys.max()) + span_top
         height = y_max - y_min + 1
 
         if height < 10 or height > int(h * 0.95):
             continue
 
-        red_count = int(red[:, start:end + 1].sum())
-        green_count = int(green[:, start:end + 1].sum())
+        red_count = int(red[span_top:span_bottom + 1, start:end + 1].sum())
+        green_count = int(green[span_top:span_bottom + 1, start:end + 1].sum())
 
         color = "red" if red_count >= green_count else "green"
         color_mask = red[:, start:end + 1] if color == "red" else green[:, start:end + 1]
+
+        # 避免同一個 x 欄位上方的圖例 / 標籤污染實體判斷。
+        color_mask = color_mask.copy()
+        color_mask[:span_top, :] = False
+        color_mask[span_bottom + 1:, :] = False
 
         # 找K棒實體：同一列顏色像素多者較像實體，1~2像素較像影線
         row_counts = color_mask.sum(axis=1)
@@ -564,6 +636,9 @@ def draw_labels(
     if draw_events:
         draw_event_points(draw, candles, up_events, down_events)
 
+    plot_top = min(c["y_high"] for c in candles) if candles else crop_y0
+    plot_bottom = max(c["y_low"] for c in candles) if candles else crop_y1
+
     for item in labels_for_draw:
         idx = item["idx"]
         typ = item["type"]
@@ -586,11 +661,19 @@ def draw_labels(
         x = c["x"]
 
         if typ == "H":
-            y = max(crop_y0 + 2, c["y_high"] - diam - 4)
+            above_y = c["y_high"] - diam - 4
+            if above_y < plot_top:
+                y = min(c["y_high"] + 4, crop_y1 - diam - 4)
+            else:
+                y = max(crop_y0 + 2, above_y)
             text_color = (255, 0, 0, 255)
             box_color = (255, 0, 0, 255)
         else:
-            y = min(crop_y1 - diam - 4, c["y_low"] + 4)
+            below_y = c["y_low"] + 4
+            if below_y + diam > plot_bottom:
+                y = max(crop_y0 + 2, c["y_low"] - diam - 4)
+            else:
+                y = min(crop_y1 - diam - 4, below_y)
             text_color = (0, 190, 0, 255)
             box_color = (0, 190, 0, 255)
 
@@ -1078,8 +1161,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v10")
-st.caption("v10：H/L 採 T 往左遞推完整標記；手動標註保留底稿選擇與最後一筆左右修正。")
+st.title("K線頭部 / 底部 自動標記 v11")
+st.caption("v11：改善上方圖例污染 K 棒高低點；H/L 採 T 往左遞推完整標記。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -1207,7 +1290,7 @@ if uploaded:
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v10.png",
+                file_name=f"marked_{display_mode}_v11.png",
                 mime="image/png",
             )
 
