@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v11
+K線頭部 / 底部自動標記 v12
 
 最終邏輯：
 1. 先找事件點
@@ -33,7 +33,7 @@ except Exception:
     streamlit_image_coordinates = None
 
 
-st.set_page_config(page_title="K線頭部底部標記 v11", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v12", layout="wide")
 
 
 # =========================
@@ -182,6 +182,265 @@ def dominant_vertical_span(sub_mask, merge_gap=2, bridge_gap=8):
     return top, bottom
 
 
+def build_candle_candidate(
+    red,
+    green,
+    neutral,
+    start,
+    end,
+    offset_x,
+    offset_y,
+    crop_h,
+    include_neutral=False,
+):
+    start = int(max(0, start))
+    end = int(min(red.shape[1] - 1, end))
+
+    if end < start:
+        return None
+
+    width = end - start + 1
+
+    if width < 3 or width > 42:
+        return None
+
+    detect_mask = red | green
+
+    if include_neutral:
+        detect_mask = detect_mask | neutral
+
+    sub_mask_all = detect_mask[:, start:end + 1]
+    span = dominant_vertical_span(sub_mask_all)
+
+    if span is None:
+        return None
+
+    span_top, span_bottom = span
+    sub_mask = sub_mask_all[span_top:span_bottom + 1]
+    ys, xs = np.where(sub_mask)
+
+    if len(ys) < 14:
+        return None
+
+    y_min = int(ys.min()) + span_top
+    y_max = int(ys.max()) + span_top
+    height = y_max - y_min + 1
+
+    min_height = 2 if include_neutral else 8
+
+    if height < min_height or height > int(crop_h * 0.95):
+        return None
+
+    red_count = int(red[span_top:span_bottom + 1, start:end + 1].sum())
+    green_count = int(green[span_top:span_bottom + 1, start:end + 1].sum())
+    neutral_count = int(neutral[span_top:span_bottom + 1, start:end + 1].sum())
+
+    if red_count >= green_count and red_count >= max(10, neutral_count * 0.45):
+        color = "red"
+        color_mask = red[:, start:end + 1]
+    elif green_count > red_count and green_count >= max(10, neutral_count * 0.45):
+        color = "green"
+        color_mask = green[:, start:end + 1]
+    elif include_neutral and neutral_count >= 14:
+        color = "neutral"
+        color_mask = neutral[:, start:end + 1]
+    else:
+        return None
+
+    # 避免同一個 x 欄位上方的圖例 / 標籤污染實體判斷。
+    color_mask = color_mask.copy()
+    color_mask[:span_top, :] = False
+    color_mask[span_bottom + 1:, :] = False
+
+    # 找K棒實體：同一列顏色像素多者較像實體，1~2像素較像影線
+    row_counts = color_mask.sum(axis=1)
+    max_row = int(row_counts.max())
+
+    if max_row <= 0:
+        return None
+
+    body_threshold = max(3, int(max_row * 0.52))
+    body_rows = np.where(row_counts >= body_threshold)[0]
+
+    if len(body_rows) == 0:
+        body_rows = np.where(row_counts >= max(2, int(max_row * 0.35)))[0]
+
+    if len(body_rows) == 0:
+        body_top = y_min
+        body_bottom = y_max
+    else:
+        body_top = int(body_rows.min())
+        body_bottom = int(body_rows.max())
+
+    # 使用者定義：
+    # 紅K收盤基準點 = 實體上邊
+    # 綠K收盤基準點 = 實體下邊
+    # 中性十字K = 實體中點
+    if color == "red":
+        close_y = body_top
+    elif color == "green":
+        close_y = body_bottom
+    else:
+        close_y = int(round((body_top + body_bottom) / 2))
+
+    x_center = (start + end) // 2
+
+    return {
+        "x_crop": x_center,
+        "x": x_center + offset_x,
+        "x1": start + offset_x,
+        "x2": end + offset_x,
+        "width": width,
+        "color": color,
+        "y_high": y_min + offset_y,
+        "y_low": y_max + offset_y,
+        "close_y": close_y + offset_y,
+        "body_top": body_top + offset_y,
+        "body_bottom": body_bottom + offset_y,
+        "score": red_count + green_count + neutral_count,
+    }
+
+
+def estimate_candle_pitch(candles):
+    if len(candles) < 3:
+        return None
+
+    xs = [c["x_crop"] for c in sorted(candles, key=lambda item: item["x_crop"])]
+    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+    gaps = [gap for gap in gaps if 12 <= gap <= 45]
+
+    if not gaps:
+        return None
+
+    return int(round(float(np.median(gaps))))
+
+
+def estimate_candle_width(candles):
+    widths = [c["width"] for c in candles if 3 <= c["width"] <= 42]
+
+    if not widths:
+        return 19
+
+    return int(round(float(np.median(widths))))
+
+
+def has_nearby_candle(candles, x_crop, min_dist):
+    return any(abs(c["x_crop"] - x_crop) < min_dist for c in candles)
+
+
+def add_missing_cadence_candles(candles, raw_runs, red, green, neutral, offset_x, offset_y, crop_h):
+    pitch = estimate_candle_pitch(candles)
+
+    if pitch is None or pitch < 8:
+        return candles
+
+    typical_width = estimate_candle_width(candles)
+    half_width = max(4, min(12, typical_width // 2))
+    near_dist = max(7, int(pitch * 0.42))
+    added = []
+
+    sorted_candles = sorted(candles, key=lambda item: item["x_crop"])
+
+    def add_center(center, include_neutral=True):
+        center = int(round(center))
+
+        if has_nearby_candle(sorted_candles + added, center, near_dist):
+            return
+
+        candidate = build_candle_candidate(
+            red=red,
+            green=green,
+            neutral=neutral,
+            start=center - half_width,
+            end=center + half_width,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            crop_h=crop_h,
+            include_neutral=include_neutral,
+        )
+
+        if candidate is not None:
+            added.append(candidate)
+
+    # 寬色塊通常是多根 K 棒被影線 / 文字連在一起，依正常 K 棒節奏拆回來。
+    for start, end in raw_runs:
+        width = end - start + 1
+
+        if width <= 42:
+            continue
+
+        prev_items = [c for c in sorted_candles if c["x_crop"] < start]
+        next_items = [c for c in sorted_candles if c["x_crop"] > end]
+        prev_x = prev_items[-1]["x_crop"] if prev_items else None
+        next_x = next_items[0]["x_crop"] if next_items else None
+
+        if prev_x is not None:
+            center = prev_x + pitch
+            while center <= end + pitch * 0.25:
+                if center >= start - pitch * 0.25:
+                    add_center(center, include_neutral=True)
+                center += pitch
+        elif next_x is not None:
+            center = next_x - pitch
+            centers = []
+            while center >= start - pitch * 0.25:
+                if center <= end + pitch * 0.25:
+                    centers.append(center)
+                center -= pitch
+            for item in reversed(centers):
+                add_center(item, include_neutral=True)
+        else:
+            center = start + half_width
+            while center <= end - half_width:
+                add_center(center, include_neutral=True)
+                center += pitch
+
+    sorted_candles = sorted(candles + added, key=lambda item: item["x_crop"])
+
+    # 若兩根已偵測 K 棒間距明顯超過節奏，補紅綠門檻抓不到的白 / 灰十字 K。
+    for left, right in zip(sorted_candles, sorted_candles[1:]):
+        gap = right["x_crop"] - left["x_crop"]
+        missing = int(round(gap / pitch)) - 1
+
+        if missing <= 0:
+            continue
+
+        for k in range(1, missing + 1):
+            center = left["x_crop"] + pitch * k
+
+            if center >= right["x_crop"] - near_dist:
+                continue
+
+            add_center(center, include_neutral=True)
+
+    return sorted(candles + added, key=lambda item: item["x_crop"])
+
+
+def dedupe_candles_by_x(candles, pitch=None):
+    if not candles:
+        return []
+
+    if pitch is None:
+        pitch = estimate_candle_pitch(candles) or 25
+
+    min_dist = max(6, int(pitch * 0.32))
+    deduped = []
+
+    for candle in sorted(candles, key=lambda item: item["x_crop"]):
+        if not deduped or candle["x_crop"] - deduped[-1]["x_crop"] >= min_dist:
+            deduped.append(candle)
+            continue
+
+        old = deduped[-1]
+        old_score = old.get("score", old["y_low"] - old["y_high"])
+        new_score = candle.get("score", candle["y_low"] - candle["y_high"])
+
+        if new_score > old_score:
+            deduped[-1] = candle
+
+    return deduped
+
+
 def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     h, w = crop.shape[:2]
 
@@ -214,6 +473,16 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
         & (b < GREEN_K["b_max"])
         & ((g - r) > GREEN_K["gr_gap"])
         & (~ma_like)
+    )
+
+    neutral = (
+        (r > 150)
+        & (g > 150)
+        & (b > 150)
+        & (np.abs(r - g) < 45)
+        & (np.abs(g - b) < 45)
+        & (~red)
+        & (~green)
     )
 
     candle_mask = red | green
@@ -251,82 +520,33 @@ def detect_candles(crop: np.ndarray, offset_x: int, offset_y: int):
     candles = []
 
     for start, end in runs:
-        width = end - start + 1
-
-        # 太窄多半雜訊；太寬可能是價格標籤或文字
-        if width < 3 or width > 42:
-            continue
-
-        sub_mask_all = candle_mask[:, start:end + 1]
-        span = dominant_vertical_span(sub_mask_all)
-
-        if span is None:
-            continue
-
-        span_top, span_bottom = span
-        sub_mask = sub_mask_all[span_top:span_bottom + 1]
-        ys, xs = np.where(sub_mask)
-
-        if len(ys) < 18:
-            continue
-
-        y_min = int(ys.min()) + span_top
-        y_max = int(ys.max()) + span_top
-        height = y_max - y_min + 1
-
-        if height < 10 or height > int(h * 0.95):
-            continue
-
-        red_count = int(red[span_top:span_bottom + 1, start:end + 1].sum())
-        green_count = int(green[span_top:span_bottom + 1, start:end + 1].sum())
-
-        color = "red" if red_count >= green_count else "green"
-        color_mask = red[:, start:end + 1] if color == "red" else green[:, start:end + 1]
-
-        # 避免同一個 x 欄位上方的圖例 / 標籤污染實體判斷。
-        color_mask = color_mask.copy()
-        color_mask[:span_top, :] = False
-        color_mask[span_bottom + 1:, :] = False
-
-        # 找K棒實體：同一列顏色像素多者較像實體，1~2像素較像影線
-        row_counts = color_mask.sum(axis=1)
-        max_row = int(row_counts.max())
-
-        body_threshold = max(3, int(max_row * 0.52))
-        body_rows = np.where(row_counts >= body_threshold)[0]
-
-        if len(body_rows) == 0:
-            body_rows = np.where(row_counts >= max(2, int(max_row * 0.35)))[0]
-
-        if len(body_rows) == 0:
-            body_top = y_min
-            body_bottom = y_max
-        else:
-            body_top = int(body_rows.min())
-            body_bottom = int(body_rows.max())
-
-        # 使用者定義：
-        # 紅K收盤基準點 = 實體上邊
-        # 綠K收盤基準點 = 實體下邊
-        close_y = body_top if color == "red" else body_bottom
-        x_center = (start + end) // 2
-
-        candles.append(
-            {
-                "x_crop": x_center,
-                "x": x_center + offset_x,
-                "x1": start + offset_x,
-                "x2": end + offset_x,
-                "width": width,
-                "color": color,
-                "y_high": y_min + offset_y,
-                "y_low": y_max + offset_y,
-                "close_y": close_y + offset_y,
-                "body_top": body_top + offset_y,
-                "body_bottom": body_bottom + offset_y,
-            }
+        candle = build_candle_candidate(
+            red=red,
+            green=green,
+            neutral=neutral,
+            start=start,
+            end=end,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            crop_h=h,
+            include_neutral=False,
         )
 
+        if candle is not None:
+            candles.append(candle)
+
+    candles = add_missing_cadence_candles(
+        candles=candles,
+        raw_runs=runs,
+        red=red,
+        green=green,
+        neutral=neutral,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        crop_h=h,
+    )
+
+    candles = dedupe_candles_by_x(candles)
     candles.sort(key=lambda c: c["x_crop"])
 
     # 只在框真的重疊 / 幾乎貼住時才合併，避免兩根K棒被包成一根
@@ -1138,7 +1358,7 @@ def annotate_kline_image(
                 "區間": f'{item["left_idx"] + 1} ~ {item["right_idx"] + 1}',
                 "估算日期": est_date,
                 "估算價格": "" if price is None else round(price, 2),
-                "K棒顏色": "紅K" if c["color"] == "red" else "綠K",
+                "K棒顏色": {"red": "紅K", "green": "綠K"}.get(c["color"], "中性K"),
             }
         )
 
@@ -1161,8 +1381,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v11")
-st.caption("v11：改善上方圖例污染 K 棒高低點；H/L 採 T 往左遞推完整標記。")
+st.title("K線頭部 / 底部 自動標記 v12")
+st.caption("v12：改善漏偵測 K 棒，補齊寬色塊與白/灰十字 K；H/L 採 T 往左遞推完整標記。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -1290,7 +1510,7 @@ if uploaded:
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v11.png",
+                file_name=f"marked_{display_mode}_v12.png",
                 mime="image/png",
             )
 
