@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v9
+K線頭部 / 底部自動標記 v10
 
 最終邏輯：
 1. 先找事件點
@@ -33,7 +33,7 @@ except Exception:
     streamlit_image_coordinates = None
 
 
-st.set_page_config(page_title="K線頭部底部標記 v9", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v10", layout="wide")
 
 
 # =========================
@@ -394,21 +394,22 @@ def build_event_points(candles, tolerance_px=0):
 # =========================
 def build_hl_from_events(candles, up_events, down_events):
     """
-    假設今日為 T，也就是最後一根 K 棒：
+    假設今日為 T，也就是最後一根 K 棒。
 
-    a = T 往前第一個跌破 5MA 之日，含 T
-    b = T 往前第一個突破 5MA 之日，含 T
+    每輪都從目前 T 往前找：
+    a = 第一個跌破 5MA 之日，含 T
+    b = 第一個突破 5MA 之日，含 T
 
-    L1 = 若 a 早於 b，取 a 與 b 兩點之間的 low 最小值，含 a、b
-    H1 = 若 a 晚於 b，取 a 與 b 兩點之間的 high 最大值，含 a、b
+    若 a 早於 b，代表區間為跌破 -> 突破，取 a 與 b 之間的
+    low 最小值，標 L。
 
-    c = a 往前第一個跌破 5MA 之日，不含 a
-    d = b 往前第一個突破 5MA 之日，不含 b
+    若 a 晚於 b，代表區間為突破 -> 跌破，取 a 與 b 之間的
+    high 最大值，標 H。
 
-    L2 = b 與 c 兩點之間的 low 最小值，含 b、c
-    H2 = a 與 d 兩點之間的 high 最大值，含 a、d
+    完成一段後，把 T 移到該段左側事件，繼續往左遞推，
+    直到找不到成對的突破 / 跌破事件為止。
 
-    區間內同高 / 同低取較右邊。
+    區間含兩端；同高 / 同低取較右邊。
     """
 
     labels = []
@@ -417,26 +418,24 @@ def build_hl_from_events(candles, up_events, down_events):
         return labels, labels
 
     current_idx = len(candles) - 1
-    a = latest_event_before_or_at(down_events, current_idx)
-    b = latest_event_before_or_at(up_events, current_idx)
+    l_count = 0
+    h_count = 0
 
-    if a is None or b is None:
-        return labels, labels
-
-    c = latest_event_before_or_at(down_events, a - 1)
-    d = latest_event_before_or_at(up_events, b - 1)
-
-    def append_l(name, event_1, event_2, source):
+    def append_label(label_type, name, event_1, event_2, source):
         left_idx, right_idx = sorted((event_1, event_2))
         segment = range(left_idx, right_idx + 1)
 
-        # y_low 越大代表價格越低；同低取較右。
-        idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
+        if label_type == "L":
+            # y_low 越大代表價格越低；同低取較右。
+            idx = max(segment, key=lambda j: (candles[j]["y_low"], j))
+        else:
+            # y_high 越小代表價格越高；同高取較右。
+            idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
 
         labels.append(
             {
                 "idx": idx,
-                "type": "L",
+                "type": label_type,
                 "name": name,
                 "left_idx": left_idx,
                 "right_idx": right_idx,
@@ -446,36 +445,23 @@ def build_hl_from_events(candles, up_events, down_events):
             }
         )
 
-    def append_h(name, event_1, event_2, source):
-        left_idx, right_idx = sorted((event_1, event_2))
-        segment = range(left_idx, right_idx + 1)
+    while current_idx >= 0:
+        a = latest_event_before_or_at(down_events, current_idx)
+        b = latest_event_before_or_at(up_events, current_idx)
 
-        # y_high 越小代表價格越高；同高取較右。
-        idx = min(segment, key=lambda j: (candles[j]["y_high"], -j))
+        if a is None or b is None:
+            break
 
-        labels.append(
-            {
-                "idx": idx,
-                "type": "H",
-                "name": name,
-                "left_idx": left_idx,
-                "right_idx": right_idx,
-                "source": source,
-                "status": "已計算",
-                "provisional": False,
-            }
-        )
-
-    if a < b:
-        append_l("L1", a, b, "a早於b，a-b取最低 low")
-    elif a > b:
-        append_h("H1", a, b, "a晚於b，a-b取最高 high")
-
-    if c is not None:
-        append_l("L2", b, c, "b-c取最低 low")
-
-    if d is not None:
-        append_h("H2", a, d, "a-d取最高 high")
+        if a < b:
+            l_count += 1
+            append_label("L", f"L{l_count}", a, b, "跌破→突破，區間取最低 low")
+            current_idx = a
+        elif a > b:
+            h_count += 1
+            append_label("H", f"H{h_count}", a, b, "突破→跌破，區間取最高 high")
+            current_idx = b
+        else:
+            break
 
     # 畫圖用：由左到右畫
     labels_for_draw = sorted(labels, key=lambda x: (x["idx"], x["type"], x["name"]))
@@ -1092,8 +1078,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v9")
-st.caption("v9：H/L 採 T 回推 a、b、c、d；手動標註新增底稿選擇與最後一筆左右修正。")
+st.title("K線頭部 / 底部 自動標記 v10")
+st.caption("v10：H/L 採 T 往左遞推完整標記；手動標註保留底稿選擇與最後一筆左右修正。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -1216,12 +1202,12 @@ if uploaded:
             c2.metric("白點突破數", info["up_events"])
             c3.metric("紅點跌破數", info["down_events"])
             c4.metric("H/L標記數", info["labels"])
-            st.caption("H/L 依最後一根 T 回推 a、b、c、d 後產生。")
+            st.caption("H/L 依最後一根 T 往左遞推，逐段完成所有成對的突破 / 跌破區間。")
 
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v9.png",
+                file_name=f"marked_{display_mode}_v10.png",
                 mime="image/png",
             )
 
@@ -1244,7 +1230,7 @@ if uploaded:
             st.write("白點突破事件序號：", info["up_event_indices"])
             st.write("紅點跌破事件序號：", info["down_event_indices"])
 
-            st.caption("規則：a為T往前第一個跌破，b為T往前第一個突破；L1/H1看a、b先後，L2用b-c，H2用a-d；區間含兩端，同高同低取右。")
+            st.caption("規則：每輪從T往前找a=第一個跌破、b=第一個突破；跌破→突破取L，突破→跌破取H；完成後把T移到該段左側事件繼續往左遞推。")
 
             if rows:
                 st.subheader("H/L 區間明細")
