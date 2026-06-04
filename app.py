@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-K線頭部 / 底部自動標記 v12
+K線頭部 / 底部自動標記 v13
 
 最終邏輯：
 1. 先找事件點
@@ -33,7 +33,7 @@ except Exception:
     streamlit_image_coordinates = None
 
 
-st.set_page_config(page_title="K線頭部底部標記 v12", layout="wide")
+st.set_page_config(page_title="K線頭部底部標記 v13", layout="wide")
 
 
 # =========================
@@ -1342,6 +1342,7 @@ def render_manual_annotation_tab(
     marks_key = f"manual_marks_{safe_key}"
     last_click_key = f"manual_last_click_{safe_key}"
     sel_key = f"manual_sel_{safe_key}"
+    base_radio_key = f"manual_base_{safe_key}"
 
     if marks_key not in st.session_state:
         st.session_state[marks_key] = []
@@ -1364,17 +1365,20 @@ def render_manual_annotation_tab(
     ):
         st.session_state[marks_key] = [dict(m) for m in auto_seed_marks]
         st.session_state[sel_key] = seed_n - 1 if seed_n else None
+        # 載入後一律切回「完全原圖」底稿，避免與自動標記圖內已烤進去的 H/L 重疊成鬼影。
+        st.session_state[base_radio_key] = "完全原圖"
         st.rerun()
 
     base_options = ["完全原圖"]
     if auto_img is not None:
-        base_options.insert(0, "自動標記圖")
+        base_options.append("自動標記圖")
 
     base_choice = st.radio(
         "手動底稿",
         base_options,
         horizontal=True,
-        key=f"manual_base_{safe_key}",
+        key=base_radio_key,
+        help="「完全原圖」：乾淨底圖，只顯示你的標記。「自動標記圖」：已含自動 H/L，請勿同時載入標記，否則會出現重複且刪不掉的 H/L。",
     )
     use_auto_base = base_choice == "自動標記圖" and auto_img is not None
     base_img = auto_img if use_auto_base else img
@@ -1393,7 +1397,7 @@ def render_manual_annotation_tab(
             key=f"manual_snap_{safe_key}",
         )
 
-    st.caption("依目前標記的 H/L 即時重算。建議：先按上面「載入自動 H/L」，底稿選「完全原圖」，再逐個修正。")
+    st.caption("依目前標記的 H/L 即時重算。畫面上的 H/L＝清冊＝切線/轉折波用的點。按「載入自動 H/L」會自動切到「完全原圖」底稿，確保三者一致。")
     t1, t2, t3 = st.columns(3)
     m_draw_tangent = t1.checkbox("切線", value=False, key=f"manual_tangent_{safe_key}")
     m_draw_wave = t2.checkbox("轉折波", value=False, key=f"manual_wave_{safe_key}")
@@ -1680,8 +1684,8 @@ def annotate_kline_image(
 # =========================
 # Streamlit UI
 # =========================
-st.title("K線頭部 / 底部 自動標記 v12")
-st.caption("v12：改善漏偵測 K 棒，補齊寬色塊與白/灰十字 K；H/L 採 T 往左遞推完整標記。")
+st.title("K線頭部 / 底部 自動標記 v13")
+st.caption("v13：改善漏偵測 K 棒，補齊寬色塊與白/灰十字 K；H/L 採 T 往左遞推完整標記。")
 
 with st.sidebar:
     st.header("標示設定")
@@ -1831,7 +1835,7 @@ if uploaded:
             st.download_button(
                 "下載標記圖 PNG",
                 data=pil_to_png_bytes(result),
-                file_name=f"marked_{display_mode}_v12.png",
+                file_name=f"marked_{display_mode}_v13.png",
                 mime="image/png",
             )
 
