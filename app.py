@@ -842,13 +842,42 @@ def label_point(candle, typ):
     return float(x), float(y)
 
 
-def newest_two_labels(labels, typ):
-    """取最新的 2 個指定型別標記，依 idx 由舊到新排序。"""
-    items = sorted((l for l in labels if l["type"] == typ), key=lambda l: l["idx"])
+def labels_to_points(labels, candles):
+    """
+    把自動 H/L 標記轉成統一的點結構：
+    每點 {type, x, y, order}，order 用 K 棒 index 表示時間先後。
+    """
+    points = []
+    for item in labels:
+        typ = item["type"]
+        x, y = label_point(candles[item["idx"]], typ)
+        points.append({"type": typ, "x": x, "y": y, "order": float(item["idx"])})
+    return points
+
+
+def manual_marks_to_points(marks):
+    """
+    把手動標註中的 H/L 轉成統一的點結構。
+    手動標記直接用使用者調整後的座標，order 以 x 位置表示時間先後。
+    """
+    points = []
+    for mark in marks:
+        typ = mark.get("target")
+        if typ not in ("H", "L"):
+            continue
+        x = float(mark.get("x", mark.get("raw_x", 0)))
+        y = float(mark.get("y", mark.get("raw_y", 0)))
+        points.append({"type": typ, "x": x, "y": y, "order": x})
+    return points
+
+
+def newest_two_points(points, typ):
+    """取最新的 2 個指定型別點，依 order 由舊到新排序。"""
+    items = sorted((p for p in points if p["type"] == typ), key=lambda p: p["order"])
     return items[-2:]
 
 
-def classify_trend(candles, labels):
+def classify_trend(points):
     """
     依最新 2 個 H 與最新 2 個 L 連線的斜率判定多空。
 
@@ -858,22 +887,20 @@ def classify_trend(candles, labels):
 
     多頭：兩條線都上升；空頭：兩條線都下降；其餘為盤整。
     """
-    h = newest_two_labels(labels, "H")
-    l = newest_two_labels(labels, "L")
+    h = newest_two_points(points, "H")
+    l = newest_two_points(points, "L")
 
     if len(h) < 2 or len(l) < 2:
         return None
 
-    def price_slope(pts, typ):
-        p1 = label_point(candles[pts[0]["idx"]], typ)
-        p2 = label_point(candles[pts[1]["idx"]], typ)
-        dx = p2[0] - p1[0]
+    def price_slope(pts):
+        dx = pts[1]["x"] - pts[0]["x"]
         if dx == 0:
             return 0.0
-        return -(p2[1] - p1[1]) / dx
+        return -(pts[1]["y"] - pts[0]["y"]) / dx
 
-    sh = price_slope(h, "H")
-    sl = price_slope(l, "L")
+    sh = price_slope(h)
+    sl = price_slope(l)
 
     if sh > 0 and sl > 0:
         return "多頭"
@@ -882,12 +909,10 @@ def classify_trend(candles, labels):
     return "盤整"
 
 
-def draw_tangent_lines(draw, candles, labels):
-    """最新 2 個 H 連一條線、最新 2 個 L 連一條線，往右延伸到最新 K 棒。"""
-    if not candles:
+def draw_tangent_lines(draw, points, x_end):
+    """最新 2 個 H 連一條線、最新 2 個 L 連一條線，往右延伸到最新 K 棒(x_end)。"""
+    if x_end is None:
         return
-
-    x_end = float(candles[-1]["x"])
 
     specs = (
         ("H", (255, 70, 70, 255)),
@@ -895,32 +920,30 @@ def draw_tangent_lines(draw, candles, labels):
     )
 
     for typ, color in specs:
-        pts = newest_two_labels(labels, typ)
+        pts = newest_two_points(points, typ)
         if len(pts) < 2:
             continue
 
-        p1 = label_point(candles[pts[0]["idx"]], typ)
-        p2 = label_point(candles[pts[1]["idx"]], typ)
-
-        dx = p2[0] - p1[0]
+        p1, p2 = pts[0], pts[1]
+        dx = p2["x"] - p1["x"]
         if dx == 0:
             continue
 
-        slope = (p2[1] - p1[1]) / dx
-        y_end = p1[1] + slope * (x_end - p1[0])
+        slope = (p2["y"] - p1["y"]) / dx
+        y_end = p1["y"] + slope * (x_end - p1["x"])
 
-        x_start = min(p1[0], p2[0])
-        y_start = p1[1] + slope * (x_start - p1[0])
+        x_start = min(p1["x"], p2["x"])
+        y_start = p1["y"] + slope * (x_start - p1["x"])
 
         draw.line([(x_start, y_start), (x_end, y_end)], fill=color, width=2)
 
 
-def draw_zigzag(draw, candles, labels):
+def draw_zigzag(draw, points):
     """
     轉折波：H 只接 L、L 只接 H。
     每個點連到左右兩側「最近的相反型」端點，頭尾端點只連一側，邊去重。
     """
-    pts = sorted(labels, key=lambda l: l["idx"])
+    pts = sorted(points, key=lambda p: p["order"])
     if len(pts) < 2:
         return
 
@@ -937,8 +960,8 @@ def draw_zigzag(draw, candles, labels):
                 break
 
     for a, b in edges:
-        pa = label_point(candles[pts[a]["idx"]], pts[a]["type"])
-        pb = label_point(candles[pts[b]["idx"]], pts[b]["type"])
+        pa = (pts[a]["x"], pts[a]["y"])
+        pb = (pts[b]["x"], pts[b]["y"])
         draw.line([pa, pb], fill=(255, 215, 0, 255), width=2)
 
 
@@ -996,11 +1019,14 @@ def draw_labels(
     if draw_events:
         draw_event_points(draw, candles, up_events, down_events)
 
+    points = labels_to_points(labels_for_draw, candles)
+    x_end = float(candles[-1]["x"]) if candles else None
+
     if draw_tangent:
-        draw_tangent_lines(draw, candles, labels_for_draw)
+        draw_tangent_lines(draw, points, x_end)
 
     if draw_wave:
-        draw_zigzag(draw, candles, labels_for_draw)
+        draw_zigzag(draw, points)
 
     if show_trend:
         draw_trend_badge(draw, trend, crop_x0, crop_y0)
@@ -1128,6 +1154,30 @@ def build_manual_mark(target: str, x: float, y: float, candles, max_x_dist: int)
     return snap_manual_mark_to_candle(mark, c)
 
 
+def build_auto_seed_marks(labels, candles):
+    """把自動算出的 H/L 標記轉成可編輯的手動標記（種子）。"""
+    seeds = []
+    for item in labels:
+        idx = item["idx"]
+        c = candles[idx]
+        typ = item["type"]
+        y = float(c["y_high"]) if typ == "H" else float(c["y_low"])
+        seeds.append(
+            {
+                "target": typ,
+                "raw_x": float(c["x"]),
+                "raw_y": y,
+                "x": float(c["x"]),
+                "y": y,
+                "idx": int(c["index"]),
+                "snapped": True,
+                "source": "auto",
+            }
+        )
+    seeds.sort(key=lambda m: m["x"])
+    return seeds
+
+
 def move_manual_mark(mark, candles, offset: int):
     if not candles or mark.get("idx") is None:
         return mark
@@ -1149,14 +1199,34 @@ def draw_manual_annotations(
     img: Image.Image,
     marks,
     candles,
+    crop_x0: int,
     crop_y0: int,
     crop_y1: int,
     draw_box: bool = True,
     label_scale: float = 1.6,
+    draw_tangent: bool = False,
+    draw_wave: bool = False,
+    show_trend: bool = False,
+    trend: str = None,
 ):
     out = img.copy().convert("RGBA")
     draw = ImageDraw.Draw(out)
     candle_by_idx = {c["index"]: c for c in candles}
+
+    # 切線 / 轉折波 / 多空判定：依手動標註後的 H/L 即時重算
+    points = manual_marks_to_points(marks)
+    x_end = float(candles[-1]["x"]) if candles else (
+        max((p["x"] for p in points), default=None)
+    )
+
+    if draw_tangent:
+        draw_tangent_lines(draw, points, x_end)
+
+    if draw_wave:
+        draw_zigzag(draw, points)
+
+    if show_trend:
+        draw_trend_badge(draw, trend, crop_x0, crop_y0)
 
     for mark in marks:
         target = mark.get("target")
@@ -1265,20 +1335,36 @@ def render_manual_annotation_tab(
     draw_box: bool,
     label_scale: float,
     auto_img: Image.Image = None,
+    auto_seed_marks=None,
 ):
     x0, y0, x1, y1 = crop_box
     safe_key = "".join(ch if ch.isalnum() else "_" for ch in upload_key)[-80:]
     marks_key = f"manual_marks_{safe_key}"
     last_click_key = f"manual_last_click_{safe_key}"
+    sel_key = f"manual_sel_{safe_key}"
 
     if marks_key not in st.session_state:
         st.session_state[marks_key] = []
     if last_click_key not in st.session_state:
         st.session_state[last_click_key] = None
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = None
 
     marks = st.session_state[marks_key]
 
     st.subheader("手動標註")
+
+    # 一鍵載入自動 H/L 為可編輯標記，之後逐個修正。
+    seed_n = len(auto_seed_marks) if auto_seed_marks else 0
+    if st.button(
+        f"載入自動 H/L 為可編輯標記（{seed_n} 筆，會取代目前手動標註）",
+        disabled=seed_n == 0,
+        key=f"manual_load_{safe_key}",
+        use_container_width=True,
+    ):
+        st.session_state[marks_key] = [dict(m) for m in auto_seed_marks]
+        st.session_state[sel_key] = seed_n - 1 if seed_n else None
+        st.rerun()
 
     base_options = ["完全原圖"]
     if auto_img is not None:
@@ -1307,6 +1393,12 @@ def render_manual_annotation_tab(
             key=f"manual_snap_{safe_key}",
         )
 
+    st.caption("依目前標記的 H/L 即時重算。建議：先按上面「載入自動 H/L」，底稿選「完全原圖」，再逐個修正。")
+    t1, t2, t3 = st.columns(3)
+    m_draw_tangent = t1.checkbox("切線", value=False, key=f"manual_tangent_{safe_key}")
+    m_draw_wave = t2.checkbox("轉折波", value=False, key=f"manual_wave_{safe_key}")
+    m_show_trend = t3.checkbox("多空判定", value=False, key=f"manual_trend_{safe_key}")
+
     try:
         crop_img, candles = detect_candles_for_box(img, crop_box)
     except Exception as e:
@@ -1314,16 +1406,47 @@ def render_manual_annotation_tab(
         candles = []
         st.warning(f"K棒吸附暫時不可用：{e}")
 
-    active_mark = marks[-1] if marks else None
+    # 選取任一筆標記來修正（可逐個調整載入的自動 H/L 或手動新增的標記）
+    # sel_key 當「待設定選取」緩衝：各按鈕寫入後，於 selectbox 建立前套用，
+    # 避免「widget 建立後再改 session_state」的例外。
+    selbox_key = f"manual_selbox_{safe_key}"
+
+    if marks:
+        pending = st.session_state[sel_key]
+        if pending is not None:
+            st.session_state[selbox_key] = clamp(int(pending), 0, len(marks) - 1)
+        st.session_state[sel_key] = None
+
+        cur = st.session_state.get(selbox_key)
+        if cur is None or cur >= len(marks):
+            st.session_state[selbox_key] = len(marks) - 1
+
+        def _mark_label(i):
+            m = marks[i]
+            kbar = "" if m.get("idx") is None else f" / 第{int(m['idx']) + 1}根"
+            src = "自動" if m.get("source") == "auto" else "手動"
+            return f"#{i + 1} {m.get('target')}{kbar}（{src}）"
+
+        sel = st.selectbox(
+            "選擇要修正的標記",
+            list(range(len(marks))),
+            format_func=_mark_label,
+            key=selbox_key,
+        )
+    else:
+        sel = None
+        st.session_state[sel_key] = None
+
+    active_mark = marks[sel] if sel is not None else None
     can_adjust = bool(active_mark and active_mark.get("idx") is not None and candles)
     active_idx = int(active_mark["idx"]) if can_adjust else None
 
     if can_adjust:
-        st.caption(f"目前修正：第 {len(marks)} 筆 / {active_mark.get('target')} / 第 {active_idx + 1} 根K棒")
-    elif marks:
-        st.caption(f"目前修正：第 {len(marks)} 筆 / 未吸附到K棒")
+        st.caption(f"目前選取：第 {sel + 1} 筆 / {active_mark.get('target')} / 第 {active_idx + 1} 根K棒")
+    elif active_mark:
+        st.caption(f"目前選取：第 {sel + 1} 筆 / 未吸附到K棒")
     else:
-        st.caption("目前修正：尚無手動標註")
+        st.caption("目前選取：尚無手動標註")
 
     m1, m2 = st.columns(2)
     if m1.button(
@@ -1332,7 +1455,7 @@ def render_manual_annotation_tab(
         key=f"manual_left_{safe_key}",
         use_container_width=True,
     ):
-        marks[-1] = move_manual_mark(marks[-1], candles, -1)
+        marks[sel] = move_manual_mark(marks[sel], candles, -1)
         st.session_state[marks_key] = marks
         st.rerun()
 
@@ -1342,28 +1465,46 @@ def render_manual_annotation_tab(
         key=f"manual_right_{safe_key}",
         use_container_width=True,
     ):
-        marks[-1] = move_manual_mark(marks[-1], candles, 1)
+        marks[sel] = move_manual_mark(marks[sel], candles, 1)
         st.session_state[marks_key] = marks
         st.rerun()
 
-    b1, b2 = st.columns(2)
-    if b1.button("復原上一筆", disabled=not marks, key=f"manual_undo_{safe_key}", use_container_width=True):
+    b1, b2, b3 = st.columns(3)
+    if b1.button("刪除選取", disabled=sel is None, key=f"manual_del_{safe_key}", use_container_width=True):
+        marks.pop(sel)
+        st.session_state[marks_key] = marks
+        st.session_state[sel_key] = (len(marks) - 1) if marks else None
+        st.rerun()
+
+    if b2.button("復原上一筆", disabled=not marks, key=f"manual_undo_{safe_key}", use_container_width=True):
         marks.pop()
         st.session_state[marks_key] = marks
+        st.session_state[sel_key] = (len(marks) - 1) if marks else None
         st.rerun()
 
-    if b2.button("清空手動標註", disabled=not marks, key=f"manual_clear_{safe_key}", use_container_width=True):
+    if b3.button("清空手動標註", disabled=not marks, key=f"manual_clear_{safe_key}", use_container_width=True):
         st.session_state[marks_key] = []
+        st.session_state[sel_key] = None
         st.rerun()
+
+    manual_trend = classify_trend(manual_marks_to_points(marks))
+
+    if m_show_trend:
+        st.metric("手動標註型態", manual_trend or "—")
 
     full_annotated = draw_manual_annotations(
         img=base_img,
         marks=marks,
         candles=candles,
+        crop_x0=x0,
         crop_y0=y0,
         crop_y1=y1,
         draw_box=draw_box,
         label_scale=label_scale,
+        draw_tangent=m_draw_tangent,
+        draw_wave=m_draw_wave,
+        show_trend=m_show_trend,
+        trend=manual_trend,
     )
     click_img = full_annotated.crop(crop_box)
 
@@ -1384,6 +1525,7 @@ def render_manual_annotation_tab(
                 raw_y = y0 + click["y"] * (click_img.height / click["height"])
                 marks.append(build_manual_mark(target, raw_x, raw_y, candles, snap_dist))
                 st.session_state[marks_key] = marks
+                st.session_state[sel_key] = len(marks) - 1
                 st.session_state[last_click_key] = click.get("unix_time")
                 st.rerun()
 
@@ -1472,7 +1614,7 @@ def annotate_kline_image(
         down_events=down_events,
     )
 
-    trend = classify_trend(candles, labels_for_draw)
+    trend = classify_trend(labels_to_points(labels_for_draw, candles))
 
     result = draw_labels(
         img=img,
@@ -1533,6 +1675,7 @@ def annotate_kline_image(
         "up_event_indices": [i + 1 for i in up_events],
         "down_event_indices": [i + 1 for i in down_events],
         "trend": trend,
+        "auto_hl_marks": build_auto_seed_marks(labels_for_draw, candles),
     }
 
     return result, rows, info
@@ -1651,6 +1794,7 @@ if uploaded:
 
     tab1, tab_manual, tab2, tab3, tab4 = st.tabs(["結果", "手動標註", "主圖裁切檢查", "事件明細", "原圖"])
     auto_result = None
+    auto_seed_marks = []
 
     try:
         result, rows, info = annotate_kline_image(
@@ -1674,6 +1818,7 @@ if uploaded:
             end_date=end_date,
         )
         auto_result = result
+        auto_seed_marks = info.get("auto_hl_marks", [])
 
         with tab1:
             st.subheader("標記結果")
@@ -1744,6 +1889,7 @@ if uploaded:
             draw_box=draw_box,
             label_scale=label_scale,
             auto_img=auto_result,
+            auto_seed_marks=auto_seed_marks,
         )
 
 else:
