@@ -833,6 +833,141 @@ def draw_event_points(draw, candles, up_events, down_events):
 
 
 # =========================
+# 切線 / 轉折波 / 多空判定
+# =========================
+def label_point(candle, typ):
+    """H 取實體上緣(y_high)，L 取實體下緣(y_low)，與標記基準一致。"""
+    x = candle["x"]
+    y = candle["y_high"] if typ == "H" else candle["y_low"]
+    return float(x), float(y)
+
+
+def newest_two_labels(labels, typ):
+    """取最新的 2 個指定型別標記，依 idx 由舊到新排序。"""
+    items = sorted((l for l in labels if l["type"] == typ), key=lambda l: l["idx"])
+    return items[-2:]
+
+
+def classify_trend(candles, labels):
+    """
+    依最新 2 個 H 與最新 2 個 L 連線的斜率判定多空。
+
+    螢幕座標 y 向下，價格越高 y 越小，因此價格斜率 = -(Δy / Δx)：
+      價格斜率 > 0 → 左下往右上（上升）
+      價格斜率 < 0 → 左上往右下（下降）
+
+    多頭：兩條線都上升；空頭：兩條線都下降；其餘為盤整。
+    """
+    h = newest_two_labels(labels, "H")
+    l = newest_two_labels(labels, "L")
+
+    if len(h) < 2 or len(l) < 2:
+        return None
+
+    def price_slope(pts, typ):
+        p1 = label_point(candles[pts[0]["idx"]], typ)
+        p2 = label_point(candles[pts[1]["idx"]], typ)
+        dx = p2[0] - p1[0]
+        if dx == 0:
+            return 0.0
+        return -(p2[1] - p1[1]) / dx
+
+    sh = price_slope(h, "H")
+    sl = price_slope(l, "L")
+
+    if sh > 0 and sl > 0:
+        return "多頭"
+    if sh < 0 and sl < 0:
+        return "空頭"
+    return "盤整"
+
+
+def draw_tangent_lines(draw, candles, labels):
+    """最新 2 個 H 連一條線、最新 2 個 L 連一條線，往右延伸到最新 K 棒。"""
+    if not candles:
+        return
+
+    x_end = float(candles[-1]["x"])
+
+    specs = (
+        ("H", (255, 70, 70, 255)),
+        ("L", (60, 200, 60, 255)),
+    )
+
+    for typ, color in specs:
+        pts = newest_two_labels(labels, typ)
+        if len(pts) < 2:
+            continue
+
+        p1 = label_point(candles[pts[0]["idx"]], typ)
+        p2 = label_point(candles[pts[1]["idx"]], typ)
+
+        dx = p2[0] - p1[0]
+        if dx == 0:
+            continue
+
+        slope = (p2[1] - p1[1]) / dx
+        y_end = p1[1] + slope * (x_end - p1[0])
+
+        x_start = min(p1[0], p2[0])
+        y_start = p1[1] + slope * (x_start - p1[0])
+
+        draw.line([(x_start, y_start), (x_end, y_end)], fill=color, width=2)
+
+
+def draw_zigzag(draw, candles, labels):
+    """
+    轉折波：H 只接 L、L 只接 H。
+    每個點連到左右兩側「最近的相反型」端點，頭尾端點只連一側，邊去重。
+    """
+    pts = sorted(labels, key=lambda l: l["idx"])
+    if len(pts) < 2:
+        return
+
+    edges = set()
+
+    for i, item in enumerate(pts):
+        for j in range(i - 1, -1, -1):
+            if pts[j]["type"] != item["type"]:
+                edges.add((j, i))
+                break
+        for j in range(i + 1, len(pts)):
+            if pts[j]["type"] != item["type"]:
+                edges.add((i, j))
+                break
+
+    for a, b in edges:
+        pa = label_point(candles[pts[a]["idx"]], pts[a]["type"])
+        pb = label_point(candles[pts[b]["idx"]], pts[b]["type"])
+        draw.line([pa, pb], fill=(255, 215, 0, 255), width=2)
+
+
+def draw_trend_badge(draw, trend, crop_x0, crop_y0):
+    """在主圖左上角標出目前型態。"""
+    if not trend:
+        return
+
+    color_map = {
+        "多頭": (255, 70, 70, 255),
+        "空頭": (60, 200, 60, 255),
+        "盤整": (200, 200, 200, 255),
+    }
+    color = color_map.get(trend, (255, 255, 255, 255))
+
+    font = get_font(22, prefer_chinese=True)
+    text = f"型態：{trend}"
+    x = crop_x0 + 8
+    y = crop_y0 + 6
+
+    bbox = draw.textbbox((x, y), text, font=font)
+    draw.rectangle(
+        [bbox[0] - 4, bbox[1] - 3, bbox[2] + 4, bbox[3] + 3],
+        fill=(0, 0, 0, 160),
+    )
+    draw.text((x, y), text, font=font, fill=color)
+
+
+# =========================
 # 畫 H / L
 # =========================
 def draw_labels(
@@ -841,12 +976,17 @@ def draw_labels(
     labels_for_draw,
     up_events,
     down_events,
+    crop_x0: int,
     crop_y0: int,
     crop_y1: int,
     display_mode: str = "HL",
     draw_box: bool = True,
     draw_events: bool = True,
     label_scale: float = 1.6,
+    draw_tangent: bool = False,
+    draw_wave: bool = False,
+    trend: str = None,
+    show_trend: bool = False,
 ):
     out = img.copy().convert("RGBA")
     draw = ImageDraw.Draw(out)
@@ -855,6 +995,15 @@ def draw_labels(
 
     if draw_events:
         draw_event_points(draw, candles, up_events, down_events)
+
+    if draw_tangent:
+        draw_tangent_lines(draw, candles, labels_for_draw)
+
+    if draw_wave:
+        draw_zigzag(draw, candles, labels_for_draw)
+
+    if show_trend:
+        draw_trend_badge(draw, trend, crop_x0, crop_y0)
 
     plot_top = min(c["y_high"] for c in candles) if candles else crop_y0
     plot_bottom = max(c["y_low"] for c in candles) if candles else crop_y1
@@ -1268,6 +1417,9 @@ def annotate_kline_image(
     draw_box=True,
     draw_events=True,
     label_scale=1.6,
+    draw_tangent=False,
+    draw_wave=False,
+    show_trend=False,
     price_top=None,
     price_bottom=None,
     start_date=None,
@@ -1320,18 +1472,25 @@ def annotate_kline_image(
         down_events=down_events,
     )
 
+    trend = classify_trend(candles, labels_for_draw)
+
     result = draw_labels(
         img=img,
         candles=candles,
         labels_for_draw=labels_for_draw,
         up_events=up_events,
         down_events=down_events,
+        crop_x0=x0,
         crop_y0=y0,
         crop_y1=y1,
         display_mode=display_mode,
         draw_box=draw_box,
         draw_events=draw_events,
         label_scale=label_scale,
+        draw_tangent=draw_tangent,
+        draw_wave=draw_wave,
+        trend=trend,
+        show_trend=show_trend,
     )
 
     rows = []
@@ -1373,6 +1532,7 @@ def annotate_kline_image(
         "crop_img": crop_img,
         "up_event_indices": [i + 1 for i in up_events],
         "down_event_indices": [i + 1 for i in down_events],
+        "trend": trend,
     }
 
     return result, rows, info
@@ -1394,8 +1554,24 @@ with st.sidebar:
         help="HL = H/L；頭底 = 頭/底",
     )
 
-    draw_box = st.checkbox("圈出被判定的H/L K棒", value=True)
+    draw_box = st.checkbox("圈出被判定的H/L K棒", value=False)
     draw_events = st.checkbox("顯示事件點：白點突破、紅點跌破", value=True)
+
+    st.divider()
+    st.subheader("型態分析")
+
+    draw_tangent = st.checkbox(
+        "切線：最新2H、2L各連線並延伸到最新K棒",
+        value=False,
+    )
+    draw_wave = st.checkbox(
+        "轉折波：H-L 依序連接（H只接L、L只接H）",
+        value=False,
+    )
+    show_trend = st.checkbox(
+        "多空判定：依最新2組H/L斜率標多頭/空頭/盤整",
+        value=False,
+    )
 
     label_scale = st.slider(
         "H/L 標記大小倍率",
@@ -1489,6 +1665,9 @@ if uploaded:
             draw_box=draw_box,
             draw_events=draw_events,
             label_scale=label_scale,
+            draw_tangent=draw_tangent,
+            draw_wave=draw_wave,
+            show_trend=show_trend,
             price_top=price_top,
             price_bottom=price_bottom,
             start_date=start_date,
@@ -1500,11 +1679,12 @@ if uploaded:
             st.subheader("標記結果")
             st.image(result, use_container_width=True)
 
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("K棒數", info["candles"])
             c2.metric("白點突破數", info["up_events"])
             c3.metric("紅點跌破數", info["down_events"])
             c4.metric("H/L標記數", info["labels"])
+            c5.metric("目前型態", info.get("trend") or "—")
             st.caption("H/L 依最後一根 T 往左遞推，逐段完成所有成對的突破 / 跌破區間。")
 
             st.download_button(
