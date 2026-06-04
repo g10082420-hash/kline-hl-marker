@@ -1407,19 +1407,14 @@ def render_manual_annotation_tab(
         st.warning(f"K棒吸附暫時不可用：{e}")
 
     # 選取任一筆標記來修正（可逐個調整載入的自動 H/L 或手動新增的標記）
-    # sel_key 當「待設定選取」緩衝：各按鈕寫入後，於 selectbox 建立前套用，
-    # 避免「widget 建立後再改 session_state」的例外。
-    selbox_key = f"manual_selbox_{safe_key}"
-
+    # sel_key 是普通整數狀態（非 widget key）：載入/新增/刪除會改變標記數量，
+    # 此時 selectbox 身分改變會採用 index；左右移動數量不變會保留目前選取。
     if marks:
-        pending = st.session_state[sel_key]
-        if pending is not None:
-            st.session_state[selbox_key] = clamp(int(pending), 0, len(marks) - 1)
-        st.session_state[sel_key] = None
-
-        cur = st.session_state.get(selbox_key)
-        if cur is None or cur >= len(marks):
-            st.session_state[selbox_key] = len(marks) - 1
+        raw_sel = st.session_state.get(sel_key)
+        if isinstance(raw_sel, int) and 0 <= raw_sel < len(marks):
+            default_idx = raw_sel
+        else:
+            default_idx = len(marks) - 1
 
         def _mark_label(i):
             m = marks[i]
@@ -1430,9 +1425,10 @@ def render_manual_annotation_tab(
         sel = st.selectbox(
             "選擇要修正的標記",
             list(range(len(marks))),
+            index=default_idx,
             format_func=_mark_label,
-            key=selbox_key,
         )
+        st.session_state[sel_key] = sel
     else:
         sel = None
         st.session_state[sel_key] = None
