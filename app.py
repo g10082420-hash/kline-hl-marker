@@ -938,6 +938,63 @@ def draw_tangent_lines(draw, points, x_end):
         draw.line([(x_start, y_start), (x_end, y_end)], fill=color, width=2)
 
 
+def uptrend_channel_lines(points):
+    """
+    上升軌道線：取最新兩個 L 連線當下軌，平移到兩個 L 之間的 H 點當上軌。
+    僅在多空判定為「多頭」（最新 2 H 與 2 L 連線都上升）時才成立。
+
+    回傳 (l1, l2, slope, h)；不適用時回傳 None。
+      - slope 為螢幕座標斜率（y 向下）。
+      - h 為兩個 L 之間、價格最高（y 最小）的 H 點。
+    """
+    if classify_trend(points) != "多頭":
+        return None
+
+    l = newest_two_points(points, "L")
+    if len(l) < 2:
+        return None
+
+    l1, l2 = l[0], l[1]
+    dx = l2["x"] - l1["x"]
+    if dx == 0:
+        return None
+
+    slope = (l2["y"] - l1["y"]) / dx  # 螢幕座標斜率
+
+    lo = min(l1["order"], l2["order"])
+    hi = max(l1["order"], l2["order"])
+    between_h = [p for p in points if p["type"] == "H" and lo < p["order"] < hi]
+    if not between_h:
+        return None
+
+    h = min(between_h, key=lambda p: p["y"])  # y 最小＝價格最高
+    return l1, l2, slope, h
+
+
+def draw_uptrend_channel(draw, points, x_end):
+    """上升軌道線：下軌(最新兩個L連線)＋上軌(平移通過兩L間最高H)，往右延伸到 x_end。"""
+    if x_end is None:
+        return
+
+    res = uptrend_channel_lines(points)
+    if not res:
+        return
+
+    l1, l2, slope, h = res
+    color = (80, 170, 255, 255)  # 藍色，與切線(H紅/L綠)區隔
+    x_start = min(l1["x"], l2["x"])
+
+    # 下軌：通過兩個 L
+    y_start_low = l1["y"] + slope * (x_start - l1["x"])
+    y_end_low = l1["y"] + slope * (x_end - l1["x"])
+    draw.line([(x_start, y_start_low), (x_end, y_end_low)], fill=color, width=2)
+
+    # 上軌：同斜率平移，通過兩 L 之間最高的 H
+    y_start_up = h["y"] + slope * (x_start - h["x"])
+    y_end_up = h["y"] + slope * (x_end - h["x"])
+    draw.line([(x_start, y_start_up), (x_end, y_end_up)], fill=color, width=2)
+
+
 def draw_zigzag(draw, points):
     """
     轉折波：H 只接 L、L 只接 H。
@@ -1008,6 +1065,7 @@ def draw_labels(
     label_scale: float = 1.6,
     draw_tangent: bool = False,
     draw_wave: bool = False,
+    draw_channel: bool = False,
     trend: str = None,
     show_trend: bool = False,
 ):
@@ -1024,6 +1082,9 @@ def draw_labels(
 
     if draw_tangent:
         draw_tangent_lines(draw, points, x_end)
+
+    if draw_channel:
+        draw_uptrend_channel(draw, points, x_end)
 
     if draw_wave:
         draw_zigzag(draw, points)
@@ -1206,6 +1267,7 @@ def draw_manual_annotations(
     label_scale: float = 1.6,
     draw_tangent: bool = False,
     draw_wave: bool = False,
+    draw_channel: bool = False,
     show_trend: bool = False,
     trend: str = None,
 ):
@@ -1213,7 +1275,7 @@ def draw_manual_annotations(
     draw = ImageDraw.Draw(out)
     candle_by_idx = {c["index"]: c for c in candles}
 
-    # 切線 / 轉折波 / 多空判定：依手動標註後的 H/L 即時重算
+    # 切線 / 上升軌道 / 轉折波 / 多空判定：依手動標註後的 H/L 即時重算
     points = manual_marks_to_points(marks)
     x_end = float(candles[-1]["x"]) if candles else (
         max((p["x"] for p in points), default=None)
@@ -1221,6 +1283,9 @@ def draw_manual_annotations(
 
     if draw_tangent:
         draw_tangent_lines(draw, points, x_end)
+
+    if draw_channel:
+        draw_uptrend_channel(draw, points, x_end)
 
     if draw_wave:
         draw_zigzag(draw, points)
@@ -1397,11 +1462,12 @@ def render_manual_annotation_tab(
             key=f"manual_snap_{safe_key}",
         )
 
-    st.caption("依目前標記的 H/L 即時重算。畫面上的 H/L＝清冊＝切線/轉折波用的點。按「載入自動 H/L」會自動切到「完全原圖」底稿，確保三者一致。")
-    t1, t2, t3 = st.columns(3)
+    st.caption("依目前標記的 H/L 即時重算。畫面上的 H/L＝清冊＝切線/上升軌道/轉折波用的點。按「載入自動 H/L」會自動切到「完全原圖」底稿，確保三者一致。")
+    t1, t2, t3, t4 = st.columns(4)
     m_draw_tangent = t1.checkbox("切線", value=False, key=f"manual_tangent_{safe_key}")
-    m_draw_wave = t2.checkbox("轉折波", value=False, key=f"manual_wave_{safe_key}")
-    m_show_trend = t3.checkbox("多空判定", value=False, key=f"manual_trend_{safe_key}")
+    m_draw_channel = t2.checkbox("上升軌道", value=False, key=f"manual_channel_{safe_key}")
+    m_draw_wave = t3.checkbox("轉折波", value=False, key=f"manual_wave_{safe_key}")
+    m_show_trend = t4.checkbox("多空判定", value=False, key=f"manual_trend_{safe_key}")
 
     try:
         crop_img, candles = detect_candles_for_box(img, crop_box)
@@ -1503,6 +1569,7 @@ def render_manual_annotation_tab(
         label_scale=label_scale,
         draw_tangent=m_draw_tangent,
         draw_wave=m_draw_wave,
+        draw_channel=m_draw_channel,
         show_trend=m_show_trend,
         trend=manual_trend,
     )
@@ -1561,6 +1628,7 @@ def annotate_kline_image(
     label_scale=1.6,
     draw_tangent=False,
     draw_wave=False,
+    draw_channel=False,
     show_trend=False,
     price_top=None,
     price_bottom=None,
@@ -1631,6 +1699,7 @@ def annotate_kline_image(
         label_scale=label_scale,
         draw_tangent=draw_tangent,
         draw_wave=draw_wave,
+        draw_channel=draw_channel,
         trend=trend,
         show_trend=show_trend,
     )
@@ -1705,6 +1774,10 @@ with st.sidebar:
 
     draw_tangent = st.checkbox(
         "切線：最新2H、2L各連線並延伸到最新K棒",
+        value=False,
+    )
+    draw_channel = st.checkbox(
+        "上升軌道：最新2L連線為下軌，平移過兩L間最高H為上軌（僅多頭）",
         value=False,
     )
     draw_wave = st.checkbox(
@@ -1811,6 +1884,7 @@ if uploaded:
             label_scale=label_scale,
             draw_tangent=draw_tangent,
             draw_wave=draw_wave,
+            draw_channel=draw_channel,
             show_trend=show_trend,
             price_top=price_top,
             price_bottom=price_bottom,
